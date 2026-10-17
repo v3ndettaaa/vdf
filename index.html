@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>veditor – Professional PDF Editor & Annotator</title>
+  <link rel="icon" type="image/png" href="icons/icon-32.png">
+  <!--
+    Layers, general to specific:
+      tokens     - design tokens only, no rules
+      main       - app shell and base chrome (.modal-dialog, .panel-body, ...)
+      components - reusable controls, and variants refining those bases
+      landing    - the landing view
+      rtl        - direction overrides
+    The bundler may reorder the emitted stylesheets, so rules that need to beat
+    another layer say so with specificity rather than relying on this order.
+  -->
+  <link rel="stylesheet" href="src/ui/styles/tokens.css">
+  <link rel="stylesheet" href="src/ui/styles/main.css">
+  <link rel="stylesheet" href="src/ui/styles/components.css">
+  <link rel="stylesheet" href="src/ui/styles/landing.css">
+  <link rel="stylesheet" href="src/ui/styles/rtl.css">
+</head>
+<body class="theme-dark">
+  <div id="app-root" class="app-container">
+    <!-- Top Navigation & Tab Bar -->
+    <header id="app-header" class="app-header"></header>
+
+    <!-- Main Workspace Container -->
+    <div id="app-workspace" class="app-workspace">
+      <!-- Left Collapsible Sidebar -->
+      <aside id="app-sidebar" class="app-sidebar collapsed"></aside>
+
+      <!-- Center Viewport Area with Document Canvas -->
+      <main id="app-viewport-container" class="app-viewport-container">
+        <!-- Floating / Dockable Toolbar -->
+        <div id="app-floating-toolbar" class="floating-toolbar"></div>
+
+        <!-- Document Viewer Scroll Area -->
+        <div id="document-scroll-container" class="document-scroll-container">
+          <div id="document-pages-wrapper" class="document-pages-wrapper">
+            <!-- Empty state when no document is open -->
+            <div id="empty-state-view" class="empty-state-view"></div>
+          </div>
+        </div>
+
+        <!-- Floating Quick Zoom & View Pill -->
+        <div id="app-view-controls" class="floating-view-controls"></div>
+
+        <!-- Floating Scratchpad / Draft Overlay -->
+        <div id="app-scratchpad"></div>
+
+        <!-- Centered PDF Loading Overlay -->
+        <div id="pdf-loading-overlay" class="pdf-loading-overlay is-hidden" aria-live="polite">
+          <div class="pdf-loading-card">
+            <div class="pdf-loading-spinner-ring"></div>
+            <div class="pdf-loading-info">
+              <div class="pdf-loading-title" id="pdf-loading-filename">Opening PDF…</div>
+              <div class="pdf-loading-subtitle" id="pdf-loading-status">Parsing document structure…</div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- Right Collapsible Properties Inspector -->
+      <aside id="app-properties-panel" class="app-properties-panel collapsed"></aside>
+    </div>
+
+    <!-- Modals, Overlays & Command Palette Containers -->
+    <div id="modal-container" class="modal-container">
+      <div id="command-palette-container"></div>
+      <div id="shortcuts-modal-container"></div>
+      <div id="settings-modal-container"></div>
+      <div id="signature-modal-container"></div>
+    </div>
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <script type="module" src="src/main.ts"></script>
+</body>
+</html>

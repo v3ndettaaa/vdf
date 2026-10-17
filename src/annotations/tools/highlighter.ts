@@ -1,0 +1,120 @@
+/**
+ * Professional Highlighter Tool
+ * Renders non-destructive translucent highlights with Multiply blend mode.
+ */
+
+import { StrokePoint, HighlighterAnnotation, BoundingBox } from '../../core/types';
+import { renderSmoothStroke, normalizeHighlighterColor } from '../spline';
+import { computePointsBoundingBox } from '../../utils/geometry';
+
+export class HighlighterTool {
+  private _activePoints: StrokePoint[] = [];
+  private _pageIndex: number = 0;
+  private _color: string = 'rgba(250, 204, 21, 0.3)';
+  private _width: number = 20;
+  private _blendMode: 'multiply' | 'source-over' = 'multiply';
+  private _straightLine: boolean = false;
+  private _tipShape: 'chisel' | 'round' = 'round';
+  private _opacity: number = 0.3;
+
+  public start(
+    point: StrokePoint,
+    pageIndex: number,
+    color: string,
+    width: number,
+    blendMode: 'multiply' | 'source-over' = 'multiply',
+    straightLine: boolean = false,
+    tipShape: 'chisel' | 'round' = 'round',
+    opacity: number = 0.3
+  ) {
+    this._activePoints = [point];
+    this._pageIndex = pageIndex;
+    this._opacity = opacity;
+    // Always store a translucent color; toolbar swatches and the native color
+    // picker yield opaque hex values which would otherwise paint solid blocks.
+    this._color = normalizeHighlighterColor(color, opacity);
+    this._width = width;
+    // `multiply` cannot blend across the separate overlay/PDF canvases, so
+    // force normal alpha compositing for predictable translucent highlights.
+    this._blendMode = 'source-over';
+    this._straightLine = straightLine;
+    this._tipShape = tipShape;
+  }
+
+  public move(point: StrokePoint, shiftKey: boolean = false): void {
+    if (this._activePoints.length === 0) return;
+
+    if (this._straightLine || shiftKey) {
+      const p0 = this._activePoints[0];
+      const dx = Math.abs(point.x - p0.x);
+      const dy = Math.abs(point.y - p0.y);
+      if (dx >= dy) {
+        // Snap straight horizontal (perfect for reading / text line highlighting)
+        this._activePoints = [p0, { ...point, y: p0.y }];
+      } else {
+        // Snap straight vertical
+        this._activePoints = [p0, { ...point, x: p0.x }];
+      }
+    } else {
+      const len = this._activePoints.length;
+      if (len > 0) {
+        const prev = this._activePoints[len - 1];
+        const dx = point.x - prev.x;
+        const dy = point.y - prev.y;
+        if (dx * dx + dy * dy < 1.0) return;
+      }
+      this._activePoints.push(point);
+    }
+  }
+
+  public renderScratchpad(ctx: CanvasRenderingContext2D, scale: number): void {
+    if (this._activePoints.length === 0) return;
+
+    ctx.save();
+    ctx.scale(scale, scale);
+    renderSmoothStroke(
+      ctx,
+      this._activePoints,
+      this._color,
+      this._width,
+      'linear',
+      true,
+      false,
+      'balanced',
+      this._tipShape
+    );
+    ctx.restore();
+  }
+
+  public finish(layerId: string): HighlighterAnnotation | null {
+    if (this._activePoints.length === 0) return null;
+
+    const box: BoundingBox = computePointsBoundingBox(this._activePoints, this._width);
+
+    const annotation: HighlighterAnnotation = {
+      id: Math.random().toString(36).substring(2, 9),
+      pageIndex: this._pageIndex,
+      layerId,
+      type: 'highlighter',
+      box,
+      points: [...this._activePoints],
+      color: normalizeHighlighterColor(this._color, this._opacity),
+      strokeWidth: this._width,
+      blendMode: 'source-over',
+      straightLine: this._straightLine,
+      tipShape: this._tipShape,
+      opacity: this._opacity,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+
+    this._activePoints = [];
+    return annotation;
+  }
+
+  public cancel(): void {
+    this._activePoints = [];
+  }
+}
+
+export const highlighterTool = new HighlighterTool();
