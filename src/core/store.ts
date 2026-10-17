@@ -109,7 +109,7 @@ class StateStore {
     snapToGrid: false,
     gridSize: 20,
     hardwareAcceleration: true,
-    maxRenderBufferPages: 3,
+    maxRenderBufferPages: 2,
     showRuler: false,
     showPageShadows: true,
     defaultZoomMode: 'fitWidth',
@@ -307,6 +307,18 @@ class StateStore {
     return () => this._closeTabListeners.delete(listener);
   }
 
+  private persistActiveSessionId(docId: string | null): void {
+    try {
+      if (typeof window !== 'undefined' && window.sessionStorage) {
+        if (docId) {
+          sessionStorage.setItem('veditor:active-doc-id', docId);
+        } else {
+          sessionStorage.removeItem('veditor:active-doc-id');
+        }
+      }
+    } catch (_) {}
+  }
+
   public setActiveDocument(doc: DocumentSession | null) {
     if (this._activeDocument && this._activeDocument.id) {
       this._activeDocument.activePageIndex = this._activePageIndex;
@@ -321,6 +333,9 @@ class StateStore {
         this._documentTabs.push({ id: doc.id, name: doc.name });
       }
       this._activePageIndex = doc.activePageIndex || 0;
+      this.persistActiveSessionId(doc.id);
+    } else {
+      this.persistActiveSessionId(null);
     }
     this._selectedAnnotationIds.clear();
     // Page indices are document-scoped; keeping them across a switch would
@@ -341,6 +356,7 @@ class StateStore {
     if (targetDoc) {
       this._activeDocument = targetDoc;
       this._activePageIndex = targetDoc.activePageIndex || 0;
+      this.persistActiveSessionId(targetDoc.id);
       this._selectedAnnotationIds.clear();
       this.notify();
     }
@@ -367,9 +383,11 @@ class StateStore {
         const nextDoc = this._openDocuments.get(nextTab.id) || null;
         this._activeDocument = nextDoc;
         this._activePageIndex = nextDoc?.activePageIndex || 0;
+        this.persistActiveSessionId(nextDoc?.id || null);
       } else {
         this._activeDocument = null;
         this._activePageIndex = 0;
+        this.persistActiveSessionId(null);
       }
     }
     this._selectedAnnotationIds.clear();
@@ -383,6 +401,7 @@ class StateStore {
     this._pageRotationsByDoc.clear();
     this._activeDocument = null;
     this._activePageIndex = 0;
+    this.persistActiveSessionId(null);
     this._selectedAnnotationIds.clear();
     this._selectedPageIndices.clear();
     this.notify();

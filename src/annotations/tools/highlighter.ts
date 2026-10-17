@@ -16,6 +16,10 @@ export class HighlighterTool {
   private _straightLine: boolean = false;
   private _tipShape: 'chisel' | 'round' = 'round';
   private _opacity: number = 0.3;
+  private _minX: number = Infinity;
+  private _minY: number = Infinity;
+  private _maxX: number = -Infinity;
+  private _maxY: number = -Infinity;
 
   public start(
     point: StrokePoint,
@@ -39,32 +43,51 @@ export class HighlighterTool {
     this._blendMode = 'source-over';
     this._straightLine = straightLine;
     this._tipShape = tipShape;
+    this._minX = point.x;
+    this._minY = point.y;
+    this._maxX = point.x;
+    this._maxY = point.y;
   }
 
-  public move(point: StrokePoint, shiftKey: boolean = false): void {
+  public move(point: StrokePoint, shiftKey: boolean = false, zoom: number = 1): void {
     if (this._activePoints.length === 0) return;
 
     if (this._straightLine || shiftKey) {
       const p0 = this._activePoints[0];
       const dx = Math.abs(point.x - p0.x);
       const dy = Math.abs(point.y - p0.y);
-      if (dx >= dy) {
-        // Snap straight horizontal (perfect for reading / text line highlighting)
-        this._activePoints = [p0, { ...point, y: p0.y }];
-      } else {
-        // Snap straight vertical
-        this._activePoints = [p0, { ...point, x: p0.x }];
-      }
+      const p1 = dx >= dy ? { ...point, y: p0.y } : { ...point, x: p0.x };
+      this._activePoints = [p0, p1];
+      this._minX = Math.min(p0.x, p1.x);
+      this._minY = Math.min(p0.y, p1.y);
+      this._maxX = Math.max(p0.x, p1.x);
+      this._maxY = Math.max(p0.y, p1.y);
     } else {
       const len = this._activePoints.length;
       if (len > 0) {
         const prev = this._activePoints[len - 1];
         const dx = point.x - prev.x;
         const dy = point.y - prev.y;
-        if (dx * dx + dy * dy < 1.0) return;
+        const minDist = 0.8 / Math.max(1, zoom);
+        if (dx * dx + dy * dy < minDist * minDist) return;
       }
+      if (point.x < this._minX) this._minX = point.x;
+      if (point.y < this._minY) this._minY = point.y;
+      if (point.x > this._maxX) this._maxX = point.x;
+      if (point.y > this._maxY) this._maxY = point.y;
       this._activePoints.push(point);
     }
+  }
+
+  public getLiveBoundingBox(): BoundingBox | null {
+    if (this._activePoints.length === 0) return null;
+    const pad = this._width * 1.5 + 6;
+    return {
+      x: this._minX - pad,
+      y: this._minY - pad,
+      width: (this._maxX - this._minX) + pad * 2,
+      height: (this._maxY - this._minY) + pad * 2
+    };
   }
 
   public renderScratchpad(ctx: CanvasRenderingContext2D, scale: number): void {
@@ -108,12 +131,16 @@ export class HighlighterTool {
       updatedAt: Date.now()
     };
 
-    this._activePoints = [];
+    this.cancel();
     return annotation;
   }
 
   public cancel(): void {
     this._activePoints = [];
+    this._minX = Infinity;
+    this._minY = Infinity;
+    this._maxX = -Infinity;
+    this._maxY = -Infinity;
   }
 }
 

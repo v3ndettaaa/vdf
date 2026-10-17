@@ -15,6 +15,7 @@ export class SignatureDialogComponent {
   private _strokes: StrokePoint[][] = [];
   private _currentStroke: StrokePoint[] = [];
   private _isDrawing = false;
+  private _wasOpen = false;
 
   constructor(container: HTMLElement) {
     this._container = container;
@@ -23,9 +24,16 @@ export class SignatureDialogComponent {
 
   public render(): void {
     if (!store.signatureModalOpen) {
-      this._container.innerHTML = '';
+      if (this._wasOpen) {
+        this._wasOpen = false;
+        this._container.innerHTML = '';
+      }
       return;
     }
+    if (this._wasOpen && this._container.querySelector('#sig-overlay')) {
+      return;
+    }
+    this._wasOpen = true;
 
     this._container.innerHTML = `
       <div class="modal-overlay" id="sig-overlay">

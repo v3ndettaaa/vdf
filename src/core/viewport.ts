@@ -36,27 +36,32 @@ export class ViewportManager {
   private _visiblePages: Set<number> = new Set();
   private _pageLayouts: ViewportPageRect[] = [];
   private _onVisiblePagesChange: ((visibleIndices: number[]) => void) | null = null;
-  /**
-   * CSS zoom-preview factor currently applied to the pages wrapper (1 when
-   * idle). Scroll offsets live in scaled space while previewing, so they must
-   * be divided back down before mapping onto the (unscaled) page layouts —
-   * otherwise the wrong pages mount (blank cracks) and eviction churns.
-   */
   private _previewScale: number = 1;
-  /**
-   * rAF coalescing for the scroll listener: a fast fling, a scrollbar drag
-   * across hundreds of pages, or the scroll correction after a zoom can fire
-   * dozens of native `scroll` events before the browser paints once. Without
-   * this, each one raced its own full visible-set recompute + mount/render
-   * pass, and the pile-up of overlapping passes was the actual cause of the
-   * post-zoom stutter and long-jump freezes — not any single pass being slow.
-   * At most one `handleScroll` runs per animation frame, always reading the
-   * latest scroll position when it does.
-   */
   private _scrollRafId: number | null = null;
+  /**
+   * Latched mathematical page anchor `(pageIndex, offsetX, offsetY)` in
+   * normalized `[0, 1]` page space. Preserved across consecutive zoom steps
+   * at the same focal point so browser scroll clamping (`scrollTop = 0` or
+   * centered margins when a page is narrower than the viewport) never causes
+   * cumulative anchor drift when zooming in and zooming back out.
+   */
+  private _zoomAnchor: {
+    docId: string;
+    pageIndex: number;
+    offsetX: number;
+    offsetY: number;
+    focalX: number;
+    focalY: number;
+    timestamp: number;
+  } | null = null;
+  private _ignoreNextScrollAnchorReset: boolean = false;
 
   public setPreviewScale(scale: number): void {
     this._previewScale = scale > 0 && Number.isFinite(scale) ? scale : 1;
+  }
+
+  public clearZoomAnchor(): void {
+    this._zoomAnchor = null;
   }
 
   public init(
@@ -68,8 +73,17 @@ export class ViewportManager {
     this._pagesWrapper = pagesWrapper;
     this._onVisiblePagesChange = onVisiblePagesChange;
 
-    this._scrollContainer.addEventListener('scroll', () => this.scheduleScrollCheck(), { passive: true });
-    window.addEventListener('resize', () => this.updateLayout(), { passive: true });
+    this._scrollContainer.addEventListener('scroll', () => {
+      if (!store.isZoomAdjusting && !this._ignoreNextScrollAnchorReset) {
+        this._zoomAnchor = null;
+      }
+      this._ignoreNextScrollAnchorReset = false;
+      this.scheduleScrollCheck();
+    }, { passive: true });
+    window.addEventListener('resize', () => {
+      this._zoomAnchor = null;
+      this.updateLayout();
+    }, { passive: true });
   }
 
   private scheduleScrollCheck(): void {
@@ -83,6 +97,7 @@ export class ViewportManager {
   /** Drops visible-set tracking (tab switch / mode change needs a clean pass). */
   public clearVisible(): void {
     this._visiblePages.clear();
+    this._zoomAnchor = null;
   }
 
   /**
@@ -99,6 +114,7 @@ export class ViewportManager {
       this._pageLayouts = [];
       this._visiblePages.clear();
       this._previewScale = 1;
+      this._zoomAnchor = null;
       this._pagesWrapper.style.width = '';
       this._pagesWrapper.style.height = '';
       this._pagesWrapper.style.minWidth = '';
@@ -226,7 +242,7 @@ export class ViewportManager {
     const rawTop = this._scrollContainer.scrollTop;
     const scrollTop = rawTop / this._previewScale;
     const viewH = this._scrollContainer.clientHeight / this._previewScale;
-    const buffer = viewH * 2.0; // 200% buffer ahead and behind so zoom-out exposes mounted pages, not gaps
+    const buffer = Math.min(viewH * 0.75, 650); // Tight preload buffer ahead and behind to protect VRAM
 
     const newVisible = new Set<number>();
     let centerPage = 0;
@@ -285,6 +301,7 @@ export class ViewportManager {
 
   public scrollToPage(pageIndex: number, opts?: { behavior?: ScrollBehavior }) {
     if (!this._scrollContainer) return;
+    this._zoomAnchor = null;
     const doc = store.activeDocument;
     if (doc) {
       pageIndex = Math.max(0, Math.min(doc.pageCount - 1, Math.floor(pageIndex)));
@@ -336,51 +353,90 @@ export class ViewportManager {
     const { width: baseW, height: baseH } = rotatedPageSize(activePage, store.pageRotations[store.activePageIndex || 0] || 0);
     const containerW = this._scrollContainer.clientWidth - 64;
     const containerH = this._scrollContainer.clientHeight - 80;
-    store.setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.min(containerW / baseW, containerH / baseH))));
+    const targetZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.min(containerW / baseW, containerH / baseH)));
+    if (this._pageLayouts.length === 0 || store.isDocSwitching) {
+      store.setZoom(targetZoom);
+      return;
+    }
+    this.zoomByFactor(targetZoom / store.zoom);
   }
 
   /**
    * Zooms by `factor` anchored to an optional focal point in scroller-space
-   * (defaults to the viewport center), so the content the user is actually
-   * looking at stays put instead of drifting toward the scroll container's
-   * top-left. Mirrors the scroll-compensation `zoomAtPoint` in main.ts, just
-   * with a center default.
+   * (defaults to the viewport center), latching the normalized `(pageIndex, u, v)`
+   * coordinate across consecutive zoom ticks at the same focal point so browser
+   * scroll clamping never causes drift when zooming in and back out.
    */
   public zoomByFactor(factor: number, focal?: { x: number; y: number }): void {
-    if (!this._scrollContainer || !store.activeDocument || !Number.isFinite(factor) || factor <= 0) return;
+    const doc = store.activeDocument;
+    if (!this._scrollContainer || !doc || !Number.isFinite(factor) || factor <= 0) return;
     const oldZoom = store.zoom;
     const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, oldZoom * factor));
     if (newZoom === oldZoom) return;
     const cx = focal ? focal.x : this._scrollContainer.clientWidth / 2;
     const cy = focal ? focal.y : this._scrollContainer.clientHeight / 2;
     if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
-    const contentX = this._scrollContainer.scrollLeft + cx;
-    const contentY = this._scrollContainer.scrollTop + cy;
-    let anchor: ViewportPageRect | undefined;
-    let nearestDistance = Infinity;
-    for (const layout of this._pageLayouts) {
-      if (layout.width <= 0 || layout.height <= 0) continue;
-      const dx = Math.max(layout.left - contentX, 0, contentX - layout.left - layout.width);
-      const dy = Math.max(layout.top - contentY, 0, contentY - layout.top - layout.height);
-      const distance = dx * dx + dy * dy;
-      if (distance < nearestDistance) {
-        anchor = layout;
-        nearestDistance = distance;
+
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const canReuseAnchor =
+      this._zoomAnchor !== null &&
+      this._zoomAnchor.docId === doc.id &&
+      Math.hypot(cx - this._zoomAnchor.focalX, cy - this._zoomAnchor.focalY) <= 10 &&
+      now - this._zoomAnchor.timestamp < 5000 &&
+      this.getLayout(this._zoomAnchor.pageIndex) !== undefined;
+
+    let anchorPageIndex: number;
+    let offsetX: number;
+    let offsetY: number;
+
+    if (canReuseAnchor && this._zoomAnchor) {
+      anchorPageIndex = this._zoomAnchor.pageIndex;
+      offsetX = this._zoomAnchor.offsetX;
+      offsetY = this._zoomAnchor.offsetY;
+      this._zoomAnchor.focalX = cx;
+      this._zoomAnchor.focalY = cy;
+      this._zoomAnchor.timestamp = now;
+    } else {
+      const contentX = this._scrollContainer.scrollLeft + cx;
+      const contentY = this._scrollContainer.scrollTop + cy;
+      let anchor: ViewportPageRect | undefined;
+      let nearestDistance = Infinity;
+      for (const layout of this._pageLayouts) {
+        if (layout.width <= 0 || layout.height <= 0) continue;
+        const dx = Math.max(layout.left - contentX, 0, contentX - layout.left - layout.width);
+        const dy = Math.max(layout.top - contentY, 0, contentY - layout.top - layout.height);
+        const distance = dx * dx + dy * dy;
+        if (distance < nearestDistance) {
+          anchor = layout;
+          nearestDistance = distance;
+        }
       }
+      if (!anchor) {
+        store.setZoom(newZoom);
+        return;
+      }
+      anchorPageIndex = anchor.pageIndex;
+      offsetX = (contentX - anchor.left) / anchor.width;
+      offsetY = (contentY - anchor.top) / anchor.height;
+      this._zoomAnchor = {
+        docId: doc.id,
+        pageIndex: anchorPageIndex,
+        offsetX,
+        offsetY,
+        focalX: cx,
+        focalY: cy,
+        timestamp: now
+      };
     }
-    if (!anchor) {
-      store.setZoom(newZoom);
-      return;
-    }
-    const offsetX = (contentX - anchor.left) / anchor.width;
-    const offsetY = (contentY - anchor.top) / anchor.height;
+
     const oldLayouts = this._pageLayouts;
     store.beginZoomAdjust();
     try {
       store.setZoom(newZoom);
       if (this._pageLayouts === oldLayouts) this.updateLayout();
-      const layout = this.getLayout(anchor.pageIndex);
+      const layout = this.getLayout(anchorPageIndex);
       if (layout) {
+        this._ignoreNextScrollAnchorReset = true;
         this._scrollContainer.scrollLeft = layout.left + offsetX * layout.width - cx;
         this._scrollContainer.scrollTop = layout.top + offsetY * layout.height - cy;
       }

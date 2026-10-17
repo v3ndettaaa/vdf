@@ -81,6 +81,12 @@ export class SidePanelsComponent {
       this._structureRevision,
       store.appSettings.language
     ].join('|');
+    if (!isOpen) {
+      this._container.classList.add('collapsed');
+      this._lastRenderKey = renderKey;
+      return;
+    }
+
     if (renderKey === this._lastRenderKey && this._container.innerHTML !== '') {
       this.syncPageSelection();
       this.syncPageBadges();
@@ -91,11 +97,6 @@ export class SidePanelsComponent {
     if (this._anchorDocId !== (doc?.id ?? null)) {
       this._anchorDocId = doc?.id ?? null;
       this._pageAnchor = null;
-    }
-
-    if (!isOpen) {
-      this._container.classList.add('collapsed');
-      return;
     }
 
     this._container.classList.remove('collapsed');

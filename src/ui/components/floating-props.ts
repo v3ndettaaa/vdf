@@ -10,7 +10,9 @@ import { getAnnotationSelectionBox } from '../../annotations/selection';
 import { mergeBoundingBoxes } from '../../utils/geometry';
 import { viewportManager } from '../../core/viewport';
 import { getIconSvg } from '../../utils/icons';
-import { Annotation } from '../../core/types';
+import { Annotation, TextAnnotation } from '../../core/types';
+import { textTool } from '../../annotations/tools/text';
+import { pointerHandler } from '../../input/pointer-handler';
 
 export let floatingPropsBar: FloatingPropsBarComponent | null = null;
 
@@ -187,7 +189,8 @@ export class FloatingPropsBarComponent {
 
     const first = selected[0] as any;
     const isShape = selected.some(a => ['rectangle', 'ellipse', 'polygon', 'freeform-shape'].includes(a.type));
-    const currentColor = first.color || '#4f46e5';
+    const isSingleText = selected.length === 1 && first.type === 'text';
+    const currentColor = first.color || first.strokeColor || '#4f46e5';
     const currentWidth = Math.round(Number(first.strokeWidth || first.fontSize || 3));
     const currentOpacity = Math.round((first.opacity ?? 1.0) * 100);
     const isLocked = first.locked === true;
@@ -231,6 +234,15 @@ export class FloatingPropsBarComponent {
           <div class="props-bar-group">
             <button class="props-pill-btn ${first.fillColor && first.fillColor !== 'transparent' ? 'active' : ''}" id="fp-fill-toggle">
               Fill
+            </button>
+          </div>
+        ` : ''}
+
+        ${isSingleText ? `
+          <div class="props-bar-divider"></div>
+          <div class="props-bar-group">
+            <button class="props-pill-btn" id="fp-edit-text-btn" title="Double-click or click to edit text">
+              Edit Text
             </button>
           </div>
         ` : ''}
@@ -309,12 +321,27 @@ export class FloatingPropsBarComponent {
       selected.forEach(ann => {
         const a = ann as any;
         const current = a.fillColor;
-        const nextFill = (!current || current === 'transparent') ? (a.color || '#6366f1') : 'transparent';
+        const nextFill = (!current || current === 'transparent') ? (a.color || a.strokeColor || '#6366f1') : 'transparent';
         const next = { ...a, fillColor: nextFill, updatedAt: Date.now() };
         history.execute(new ModifyAnnotationCommand(ann.pageIndex, ann, next));
       });
       store.setActivePageIndex(pageIndex);
       this.renderContent();
+    });
+
+    // Edit Text button
+    this._container.querySelector('#fp-edit-text-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const first = selected[0];
+      if (!first || first.type !== 'text') return;
+      const pageContainer = document.querySelector<HTMLElement>(`.pdf-page-container[data-page-index="${first.pageIndex}"]`);
+      const scratchCanvas = pageContainer?.querySelector<HTMLCanvasElement>('.scratchpad-canvas');
+      if (scratchCanvas) {
+        this.hideImmediate();
+        pointerHandler.editExistingTextAnnotation(first as TextAnnotation, first.pageIndex, scratchCanvas, () => {
+          window.app?.repaintAllRenderedAnnotations();
+        });
+      }
     });
 
     // Duplicate
@@ -360,7 +387,9 @@ export class FloatingPropsBarComponent {
   private applyColor(selected: Annotation[], color: string): void {
     selected.forEach(ann => {
       const prev = ann as any;
-      const next = { ...prev, color, updatedAt: Date.now() };
+      const next = { ...prev, updatedAt: Date.now() };
+      if ('color' in next) next.color = color;
+      if ('strokeColor' in next) next.strokeColor = color;
       history.execute(new ModifyAnnotationCommand(ann.pageIndex, prev, next));
     });
     store.setActivePageIndex(selected[0].pageIndex);
@@ -375,8 +404,26 @@ export class FloatingPropsBarComponent {
         const next = { ...a, strokeWidth: nw, updatedAt: Date.now() };
         history.execute(new ModifyAnnotationCommand(ann.pageIndex, a, next));
       } else if ('fontSize' in a) {
-        const nf = Math.max(6, Math.min(120, (a.fontSize || 14) + delta * 2));
-        const next = { ...a, fontSize: nf, updatedAt: Date.now() };
+        const nf = Math.max(8, Math.min(120, (a.fontSize || 16) + delta * 2));
+        const measured = textTool.measureTextBox(
+          a.text || '',
+          nf,
+          a.fontFamily || 'Inter',
+          a.padding ?? 8,
+          a.fontWeight,
+          a.fontStyle
+        );
+        const next = {
+          ...a,
+          fontSize: nf,
+          box: {
+            x: a.box.x,
+            y: a.box.y,
+            width: measured.width,
+            height: measured.height
+          },
+          updatedAt: Date.now()
+        };
         history.execute(new ModifyAnnotationCommand(ann.pageIndex, a, next));
       }
     });

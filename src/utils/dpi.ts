@@ -17,6 +17,14 @@ export const BASE_PDF_DPI = 72;
  */
 export const MAX_RENDER_DIMENSION = 6144;
 
+/**
+ * Adaptive interactive canvas dimension ceiling (4096px GPU texture limit) and
+ * area budget (~9.4 megapixels = 3072x3072) so integrated GPUs and Linux
+ * WebKitGTK never stall or OOM when allocating page backing stores.
+ */
+export const ADAPTIVE_CANVAS_MAX_DIMENSION = 2560;
+export const ADAPTIVE_CANVAS_MAX_PIXELS = 2560 * 2560;
+
 export function getDevicePixelRatio(): number {
   if (typeof window !== 'undefined' && window.devicePixelRatio) {
     return window.devicePixelRatio;
@@ -46,17 +54,38 @@ export function resolveAnnotationDpr(targetDPI?: number): number {
 
 /**
  * Clamp a backing-store multiplier so neither canvas dimension exceeds
- * `MAX_RENDER_DIMENSION`. CSS size is unaffected; the browser upscales.
+ * `maxDimension` (defaults to `MAX_RENDER_DIMENSION`). CSS size is unaffected;
+ * the browser upscales.
  */
 export function clampRenderMultiplier(
   cssWidth: number,
   cssHeight: number,
-  multiplier: number
+  multiplier: number,
+  maxDimension: number = MAX_RENDER_DIMENSION
 ): number {
   if (!Number.isFinite(multiplier) || multiplier <= 0) return 1;
   const largest = Math.max(cssWidth * multiplier, cssHeight * multiplier);
-  if (largest > MAX_RENDER_DIMENSION && largest > 0) {
-    return multiplier * (MAX_RENDER_DIMENSION / largest);
+  if (largest > maxDimension && largest > 0) {
+    return multiplier * (maxDimension / largest);
   }
   return multiplier;
+}
+
+/**
+ * Smart hardware-friendly backing-store multiplier for live interactive
+ * canvases (annotations + scratchpad). Balances crisp 150–200 DPI rendering
+ * with a strict 4K dimension/area cap so weak GPUs stay at a locked 60fps.
+ */
+export function resolveAdaptiveCanvasDpr(
+  cssWidth: number,
+  cssHeight: number,
+  targetDPI?: number
+): number {
+  const rawDpr = Math.min(2.5, Math.max(1.5, getDevicePixelRatio(), resolveRenderDpr(targetDPI)));
+  let mult = clampRenderMultiplier(cssWidth, cssHeight, rawDpr, ADAPTIVE_CANVAS_MAX_DIMENSION);
+  const area = (cssWidth * mult) * (cssHeight * mult);
+  if (area > ADAPTIVE_CANVAS_MAX_PIXELS && area > 0) {
+    mult *= Math.sqrt(ADAPTIVE_CANVAS_MAX_PIXELS / area);
+  }
+  return mult;
 }

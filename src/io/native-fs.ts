@@ -51,6 +51,15 @@ export async function nativeOpenPdfDialog(): Promise<{ path: string; bytes: Uint
 export async function nativeReadFile(path: string): Promise<Uint8Array | null> {
   if (!isDesktop()) return null;
   try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const raw = await invoke<ArrayBuffer | Uint8Array | number[]>('native_read_pdf_fast', { path });
+    if (raw instanceof Uint8Array) return raw;
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    if (Array.isArray(raw)) return new Uint8Array(raw);
+  } catch {
+    // Fallback to plugin-fs below
+  }
+  try {
     const { readFile } = await import('@tauri-apps/plugin-fs');
     return await readFile(path);
   } catch (e) {
@@ -61,6 +70,13 @@ export async function nativeReadFile(path: string): Promise<Uint8Array | null> {
 
 export async function nativeWriteFile(path: string, bytes: Uint8Array): Promise<boolean> {
   if (!isDesktop()) return false;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const ok = await invoke<boolean>('native_write_pdf_fast', { path, bytes: Array.from(bytes) });
+    if (ok) return true;
+  } catch {
+    // Fallback to plugin-fs below
+  }
   try {
     const { writeFile } = await import('@tauri-apps/plugin-fs');
     await writeFile(path, bytes);
@@ -118,10 +134,18 @@ export async function nativeReadDir(path: string): Promise<NativeDirEntry[]> {
 
 /**
  * PIPE_5: Recursive crawl of directory tree filtering .pdf files.
+ * Uses single-pass native Rust command when available, with JS fallback.
  * Sorted [dirs_first: true, alpha: asc].
  */
 export async function nativeBuildFileTree(rootPath: string): Promise<FileNode | null> {
   if (!isDesktop()) return null;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const tree = await invoke<FileNode | null>('native_build_file_tree', { rootPath });
+    if (tree) return tree;
+  } catch {
+    // Fallback to JS recursive crawl
+  }
   const safeRoot = sanitizePath(rootPath);
 
   async function crawl(dirPath: string): Promise<FileNode[]> {

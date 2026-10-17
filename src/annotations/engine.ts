@@ -94,6 +94,16 @@ export class AnnotationEngine {
   /**
    * Renders all committed annotations onto the page's annotation canvas.
    */
+  private _editingAnnotationId: string | null = null;
+
+  public setEditingAnnotationId(id: string | null): void {
+    this._editingAnnotationId = id;
+  }
+
+  public get editingAnnotationId(): string | null {
+    return this._editingAnnotationId;
+  }
+
   public renderCommittedAnnotations(
     ctx: CanvasRenderingContext2D,
     annotations: Annotation[],
@@ -101,6 +111,7 @@ export class AnnotationEngine {
     scale: number = 1.0
   ): void {
     for (const ann of annotations) {
+      if (this._editingAnnotationId && ann.id === this._editingAnnotationId) continue;
       ctx.save();
       // Highlighter ink already carries its translucency in the color alpha;
       // applying `opacity` again would double-fade it (and diverge from the
@@ -126,6 +137,7 @@ export class AnnotationEngine {
     const visibleAnnotations = doc.annotations[pageIndex] || [];
 
     for (const ann of visibleAnnotations) {
+      if (this._editingAnnotationId && ann.id === this._editingAnnotationId) continue;
       ctx.save();
       // Highlighter ink already carries its translucency in the color alpha;
       // applying `opacity` again would double-fade it (and diverge from the

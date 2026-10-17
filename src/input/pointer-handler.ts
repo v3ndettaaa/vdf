@@ -3,11 +3,11 @@
  * Handles 120/240Hz coalesced events, stylus pressure, palm rejection, and tool dispatching.
  */
 
-import { Point, StrokePoint, ToolType, ToolOptionKey, Annotation, BoundingBox, ShapeAnnotation } from '../core/types';
+import { Point, StrokePoint, ToolType, ToolOptionKey, Annotation, BoundingBox, ShapeAnnotation, TextAnnotation } from '../core/types';
 import { store } from '../core/store';
-import { history, AddAnnotationCommand, DeleteAnnotationsCommand, ReplaceAnnotationsCommand, BulkModifyCommand } from '../core/history';
+import { history, AddAnnotationCommand, DeleteAnnotationsCommand, ReplaceAnnotationsCommand, BulkModifyCommand, ModifyAnnotationCommand } from '../core/history';
 import { mergeBoundingBoxes, computePointsBoundingBox, findNearestVertex } from '../utils/geometry';
-import { resolveAnnotationDpr, clampRenderMultiplier } from '../utils/dpi';
+import { resolveAdaptiveCanvasDpr } from '../utils/dpi';
 import { fitStroke, type FittedShape } from '../utils/shape-fit';
 import { renderLiveStroke } from '../annotations/spline';
 import { tween, easeOutCubic, type TweenHandle } from '../utils/tween';
@@ -35,12 +35,19 @@ import {
   moveAnnotationEndpoint
 } from '../annotations/selection';
 import { floatingPropsBar } from '../ui/components/floating-props';
+import { openInlineEditor } from '../ui/components/inline-editor';
 
 export class PointerHandler {
   private _isPointerDown: boolean = false;
   private _activePageIndex: number = -1;
   private _pageScratchCanvas: HTMLCanvasElement | null = null;
   private _pageScratchCtx: CanvasRenderingContext2D | null = null;
+  /** Cached bounding rect for the active scratchpad canvas during a stroke to avoid layout reflows on 240Hz pointermove. */
+  private _activeCanvasRect: DOMRect | null = null;
+  /** Last painted device-pixel bounding box on the scratchpad for O(1) dirty-rect clearing. */
+  private _scratchDirtyRect: BoundingBox | null = null;
+  /** Coalesced rAF id for live pen/highlighter scratchpad rendering. */
+  private _scratchRafId: number | null = null;
   private _lastPointerTime: number = 0;
   private _lastPointerX: number = 0;
   private _lastPointerY: number = 0;
@@ -113,19 +120,105 @@ export class PointerHandler {
     }
   }
 
+  private _scratchNeedsTrailingPaint: boolean = false;
+
   /**
-   * Backing-store multiplier matching the page canvases (target DPI, clamped
-   * so a page's backing store never exceeds MAX_RENDER_DIMENSION). Live
-   * previews and handle hit-tests must use the same scale as committed
-   * rendering or they drift on HiDPI / custom-DPI displays.
+   * Resolves the active visual rendering canvas for live strokes. When a page
+   * is at high zoom and its High-DPI viewport scratchpad chunk (`_chunkCanvas`)
+   * is active, live strokes render onto that viewport-clipped canvas at 100%
+   * native display DPI while `scratchCanvas` remains the full-page event target.
+   */
+  private resolveRenderScratchCanvas(scratchCanvas: HTMLCanvasElement): HTMLCanvasElement {
+    const chunk = (scratchCanvas as HTMLCanvasElement & { _chunkCanvas?: HTMLCanvasElement })._chunkCanvas;
+    if (chunk && chunk.style.display === 'block' && chunk.width > 1 && chunk.height > 1) {
+      return chunk;
+    }
+    return scratchCanvas;
+  }
+
+  /**
+   * Applies the viewport-chunk pixel offset (`-offsetX * dpr, -offsetY * dpr`)
+   * when rendering onto a High-DPI viewport scratchpad chunk. No-op on a
+   * standard full-page scratchpad.
+   */
+  private withScratchOffset(
+    ctx: CanvasRenderingContext2D,
+    canvas: HTMLCanvasElement | null,
+    fn: () => void
+  ): void {
+    const ox = canvas ? parseFloat(canvas.dataset.offsetX || '0') : 0;
+    const oy = canvas ? parseFloat(canvas.dataset.offsetY || '0') : 0;
+    if ((ox !== 0 || oy !== 0) && Number.isFinite(ox) && Number.isFinite(oy)) {
+      const dpr = this.renderDpr();
+      ctx.save();
+      ctx.translate(-ox * dpr, -oy * dpr);
+      try {
+        fn();
+      } finally {
+        ctx.restore();
+      }
+    } else {
+      fn();
+    }
+  }
+
+  /**
+   * Exact backing-store multiplier matching the page canvases (`c.width / cssW`).
+   * Guarantees 100% pixel identity between live scratchpad strokes and committed
+   * annotations at every zoom level (20% to 800%), even when the canvas backing
+   * store is capped by the adaptive VRAM budget.
    */
   private renderDpr(): number {
     const c = this._pageScratchCanvas;
-    const target = resolveAnnotationDpr(store.appSettings.targetDPI);
-    if (!c) return target;
-    const cssW = parseFloat(c.style.width) || c.width;
-    const cssH = parseFloat(c.style.height) || c.height;
-    return clampRenderMultiplier(cssW, cssH, target);
+    if (!c) return resolveAdaptiveCanvasDpr(612, 792, store.appSettings.targetDPI);
+    const cssW = parseFloat(c.dataset.baseWidth || '') || parseFloat(c.style.width) || c.clientWidth || c.width;
+    if (cssW > 0 && c.width > 1) {
+      return c.width / cssW;
+    }
+    const cssH = parseFloat(c.dataset.baseHeight || '') || parseFloat(c.style.height) || c.clientHeight || c.height;
+    return resolveAdaptiveCanvasDpr(cssW, cssH, store.appSettings.targetDPI);
+  }
+
+  /** Clears either the dirty sub-rectangle or the full scratchpad canvas. */
+  private clearScratchpadDirty(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement): void {
+    const d = this._scratchDirtyRect;
+    if (d) {
+      const x = Math.max(0, Math.floor(d.x) - 2);
+      const y = Math.max(0, Math.floor(d.y) - 2);
+      const w = Math.min(canvas.width - x, Math.ceil(d.width) + 4);
+      const h = Math.min(canvas.height - y, Math.ceil(d.height) + 4);
+      if (w > 0 && h > 0) {
+        ctx.clearRect(x, y, w, h);
+      }
+      this._scratchDirtyRect = null;
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }
+
+  private setScratchpadDirtyFromPageBox(pageBox: BoundingBox | null, renderScale: number): void {
+    if (!pageBox) {
+      this._scratchDirtyRect = null;
+      return;
+    }
+    const cv = this._pageScratchCanvas;
+    const ox = cv ? parseFloat(cv.dataset.offsetX || '0') : 0;
+    const oy = cv ? parseFloat(cv.dataset.offsetY || '0') : 0;
+    const dpr = this.renderDpr();
+    this._scratchDirtyRect = {
+      x: pageBox.x * renderScale - ox * dpr,
+      y: pageBox.y * renderScale - oy * dpr,
+      width: pageBox.width * renderScale,
+      height: pageBox.height * renderScale
+    };
+  }
+
+  private cancelScratchRaf(): void {
+    if (this._scratchRafId !== null) {
+      cancelAnimationFrame(this._scratchRafId);
+      this._scratchRafId = null;
+    }
+    this._scratchNeedsTrailingPaint = false;
   }
 
   /**
@@ -266,7 +359,8 @@ export class PointerHandler {
     const pts = penTool.getActivePoints();
     if (pts.length < 8) return;
     const box = computePointsBoundingBox([...pts]);
-    if (Math.hypot(box.width, box.height) < PointerHandler.HOLD_MIN_SIZE) return;
+    const minSizePage = PointerHandler.HOLD_MIN_SIZE / Math.max(store.zoom, 0.25);
+    if (Math.hypot(box.width, box.height) < minSizePage) return;
     const fit = fitStroke(pts.map(p => ({ x: p.x, y: p.y })));
     if (!fit) return;
     this._holdFired = true;
@@ -310,25 +404,29 @@ export class PointerHandler {
         // Ink clears in the first 40% so the settle reads on a clean page.
         const inkAlpha = 1 - easeOutCubic(Math.min(1, t / 0.4));
         if (inkAlpha > 0.01) {
-          c.save();
-          c.globalAlpha = inkAlpha;
-          c.scale(renderScale, renderScale);
-          renderLiveStroke(c, rawPts, rawColor, rawWidth, rawCurve, rawPressure, rawStrength);
-          c.restore();
+          this.withScratchOffset(c, cv, () => {
+            c.save();
+            c.globalAlpha = inkAlpha;
+            c.scale(renderScale, renderScale);
+            renderLiveStroke(c, rawPts, rawColor, rawWidth, rawCurve, rawPressure, rawStrength);
+            c.restore();
+          });
         }
 
         const settle = easeOutCubic(t);
         const scaleFactor = 1.06 - 0.06 * settle;
-        c.save();
-        c.globalAlpha = settle;
-        // Grow/settle around the shape's own center, in page units.
-        c.scale(renderScale, renderScale);
-        c.translate(shapeCx, shapeCy);
-        c.scale(scaleFactor, scaleFactor);
-        c.translate(-shapeCx, -shapeCy);
-        // Already scaled to page units above: render at scale 1.
-        annotationEngine.renderSingleAnnotation(c, preview, 1);
-        c.restore();
+        this.withScratchOffset(c, cv, () => {
+          c.save();
+          c.globalAlpha = settle;
+          // Grow/settle around the shape's own center, in page units.
+          c.scale(renderScale, renderScale);
+          c.translate(shapeCx, shapeCy);
+          c.scale(scaleFactor, scaleFactor);
+          c.translate(-shapeCx, -shapeCy);
+          // Already scaled to page units above: render at scale 1.
+          annotationEngine.renderSingleAnnotation(c, preview, 1);
+          c.restore();
+        });
       },
       onComplete: () => {
         this._morphHandle = null;
@@ -338,7 +436,9 @@ export class PointerHandler {
         if (!c || !cv) return;
         c.setTransform(1, 0, 0, 1, 0, 0);
         c.clearRect(0, 0, cv.width, cv.height);
-        annotationEngine.renderSingleAnnotation(c, preview, renderScale);
+        this.withScratchOffset(c, cv, () => {
+          annotationEngine.renderSingleAnnotation(c, preview, renderScale);
+        });
       }
     });
   }
@@ -405,11 +505,15 @@ export class PointerHandler {
       return;
     }
 
+    this.cancelScratchRaf();
     this._isPointerDown = true;
     this._activePageIndex = pageIndex;
-    this._pageScratchCanvas = scratchCanvas;
-    this._pageScratchCtx = scratchCanvas.getContext('2d');
-    this._lastPointerTime = Date.now();
+    const renderCanvas = this.resolveRenderScratchCanvas(scratchCanvas);
+    this._pageScratchCanvas = renderCanvas;
+    this._pageScratchCtx = renderCanvas.getContext('2d');
+    this._activeCanvasRect = scratchCanvas.getBoundingClientRect();
+    this._scratchDirtyRect = null;
+    this._lastPointerTime = performance.now();
     this._lastPointerX = e.clientX;
     this._lastPointerY = e.clientY;
     this._simulatedVelocityPressure = 0.5;
@@ -437,6 +541,16 @@ export class PointerHandler {
           tSettings.pressureStrength || 'balanced',
           tSettings.strokeSmoothing || 'medium'
         );
+        if (this._pageScratchCtx && this._pageScratchCanvas) {
+          const c = this._pageScratchCtx;
+          const cv = this._pageScratchCanvas;
+          const rs = store.zoom * this.renderDpr();
+          this.clearScratchpadDirty(c, cv);
+          this.withScratchOffset(c, cv, () => {
+            penTool.renderScratchpad(c, rs);
+          });
+          this.setScratchpadDirtyFromPageBox(penTool.getLiveBoundingBox(), rs);
+        }
         this.startHoldTimer({ x: pt.x, y: pt.y });
         break;
       }
@@ -452,6 +566,16 @@ export class PointerHandler {
           tSettings.highlighterTipShape,
           tSettings.highlighterOpacity ?? 0.45
         );
+        if (this._pageScratchCtx && this._pageScratchCanvas) {
+          const c = this._pageScratchCtx;
+          const cv = this._pageScratchCanvas;
+          const rs = store.zoom * this.renderDpr();
+          this.clearScratchpadDirty(c, cv);
+          this.withScratchOffset(c, cv, () => {
+            highlighterTool.renderScratchpad(c, rs);
+          });
+          this.setScratchpadDirtyFromPageBox(highlighterTool.getLiveBoundingBox(), rs);
+        }
         break;
       }
 
@@ -476,32 +600,36 @@ export class PointerHandler {
               history.execute(new AddAnnotationCommand(pageIndex, polyAnn));
             }
             this._snapTarget = null;
-            if (this._pageScratchCtx) {
-              this._pageScratchCtx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
-            }
-            onNeedRepaint();
-            return;
+          if (this._pageScratchCtx && this._pageScratchCanvas) {
+            this._pageScratchCtx.clearRect(0, 0, this._pageScratchCanvas.width, this._pageScratchCanvas.height);
           }
-          if (this._pageScratchCtx) {
-            this._pageScratchCtx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
-            shapesTool.renderScratchpad(this._pageScratchCtx, store.zoom * (this.renderDpr()));
-          }
+          onNeedRepaint();
           return;
         }
-
-        this._snapTarget = null;
-        shapesTool.start(
-          pt,
-          pageIndex,
-          'polygon',
-          tSettings.shapeColor,
-          tSettings.shapeFillColor,
-          this.lensWidth(tSettings.shapeWidth),
-          tSettings.shapeStyle,
-          tSettings.shapeOutline !== false
-        );
-        break;
+        if (this._pageScratchCtx && this._pageScratchCanvas) {
+          const c = this._pageScratchCtx;
+          const cv = this._pageScratchCanvas;
+          c.clearRect(0, 0, cv.width, cv.height);
+          this.withScratchOffset(c, cv, () => {
+            shapesTool.renderScratchpad(c, store.zoom * this.renderDpr());
+          });
+        }
+        return;
       }
+
+      this._snapTarget = null;
+      shapesTool.start(
+        pt,
+        pageIndex,
+        'polygon',
+        tSettings.shapeColor,
+        tSettings.shapeFillColor,
+        this.lensWidth(tSettings.shapeWidth),
+        tSettings.shapeStyle,
+        tSettings.shapeOutline !== false
+      );
+      break;
+    }
 
       case 'rectangle':
       case 'ellipse':
@@ -524,22 +652,26 @@ export class PointerHandler {
       }
 
       case 'text': {
-        const textAnn = textTool.createTextAnnotation(
-          pt,
-          pageIndex,
-          defaultLayerId,
-          'Double click to edit text',
-          this.lensWidth(tSettings.fontSize),
-          tSettings.fontFamily,
-          tSettings.textColor,
-          tSettings.textBgColor,
-          tSettings.textAlign
-        );
-        history.execute(new AddAnnotationCommand(pageIndex, textAnn));
-        store.setActiveTool('select');
-        this.selectCreatedAnnotation(textAnn.id);
-        onNeedRepaint();
-        break;
+        // Release pointer state immediately so moving the cursor into the
+        // floating inline textarea does not trigger drag/move handlers.
+        this._isPointerDown = false;
+        this._strokeTool = null;
+        this._activePageIndex = -1;
+        this._pageScratchCanvas = null;
+        this._pageScratchCtx = null;
+        this._activeCanvasRect = null;
+
+        const existingAnns = store.activeDocument?.annotations[pageIndex] || [];
+        const hit = selectionManager.findAnnotationAtPoint(pt, existingAnns);
+        if (hit && hit.type === 'text') {
+          store.setActiveTool('select');
+          this.selectCreatedAnnotation(hit.id);
+          this.editExistingTextAnnotation(hit, pageIndex, scratchCanvas, onNeedRepaint);
+          return;
+        }
+
+        this.beginNewTextAnnotation(pt, pageIndex, scratchCanvas, onNeedRepaint);
+        return;
       }
 
       case 'stamp':
@@ -676,14 +808,19 @@ export class PointerHandler {
       shapesTool.isPolygonActive() &&
       shapesTool.activePageIndex === pageIndex
     ) {
-      const ctx = scratchCanvas.getContext('2d');
+      const renderCanvas = this.resolveRenderScratchCanvas(scratchCanvas);
+      const ctx = renderCanvas.getContext('2d');
       if (ctx) {
+        this._pageScratchCanvas = renderCanvas;
         const hoverPt = this.getPointInPage(e, scratchCanvas);
         const placed = this.snapToVertex(hoverPt, pageIndex);
         shapesTool.move(placed, e.shiftKey, e.shiftKey || this.toolOpt('polygon', 'snapAngle15'));
-        ctx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
-        shapesTool.renderScratchpad(ctx, store.zoom * this.renderDpr());
-        this.renderSnapTarget(ctx, store.zoom * this.renderDpr());
+        ctx.clearRect(0, 0, renderCanvas.width, renderCanvas.height);
+        const rs = store.zoom * this.renderDpr();
+        this.withScratchOffset(ctx, renderCanvas, () => {
+          shapesTool.renderScratchpad(ctx, rs);
+          this.renderSnapTarget(ctx, rs);
+        });
       }
       return;
     }
@@ -701,15 +838,94 @@ export class PointerHandler {
     const ctx = this._pageScratchCtx;
     if (!ctx) return;
 
-    // Clear scratchpad canvas once per frame
-    ctx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
-
     const dpr = this.renderDpr();
     const renderScale = store.zoom * dpr;
     const pts = coalescedEvents.map((evt: PointerEvent) => this.getPointInPage(evt, scratchCanvas));
     if (pts.length === 0) return;
     const lastPt = pts[pts.length - 1];
     const shiftKey = (e as MouseEvent).shiftKey === true;
+
+    // Zero-latency leading + rAF-coalesced trailing path for freehand ink & highlighter
+    if (tool === 'pen') {
+      for (const pt of pts) penTool.move(pt, store.zoom);
+      const holdRadiusPage = PointerHandler.HOLD_RADIUS / Math.max(store.zoom, 0.25);
+      if (this._holdAnchor && Math.hypot(lastPt.x - this._holdAnchor.x, lastPt.y - this._holdAnchor.y) > holdRadiusPage) {
+        this._holdFired = false;
+        this._holdShape = null;
+        this._morphHandle?.cancel();
+        this._morphHandle = null;
+        this.startHoldTimer({ x: lastPt.x, y: lastPt.y });
+      }
+      const paintPen = () => {
+        if (!this._isPointerDown || !this._pageScratchCtx || !this._pageScratchCanvas) return;
+        const c = this._pageScratchCtx;
+        const cv = this._pageScratchCanvas;
+        const rs = store.zoom * this.renderDpr();
+        if (this._holdFired && this._holdShape) {
+          c.clearRect(0, 0, cv.width, cv.height);
+          this._scratchDirtyRect = null;
+          const preview = this.buildHoldShapeAnnotation(this._holdShape, pageIndex, 'layer-default');
+          if (preview) {
+            this.withScratchOffset(c, cv, () => {
+              annotationEngine.renderSingleAnnotation(c, preview, rs);
+            });
+          }
+        } else {
+          this.clearScratchpadDirty(c, cv);
+          this.withScratchOffset(c, cv, () => {
+            penTool.renderScratchpad(c, rs);
+          });
+          this.setScratchpadDirtyFromPageBox(penTool.getLiveBoundingBox(), rs);
+        }
+      };
+      if (this._scratchRafId === null) {
+        paintPen();
+        this._scratchNeedsTrailingPaint = false;
+        this._scratchRafId = requestAnimationFrame(() => {
+          this._scratchRafId = null;
+          if (this._scratchNeedsTrailingPaint) {
+            this._scratchNeedsTrailingPaint = false;
+            paintPen();
+          }
+        });
+      } else {
+        this._scratchNeedsTrailingPaint = true;
+      }
+      return;
+    }
+
+    if (tool === 'highlighter') {
+      for (const pt of pts) highlighterTool.move(pt, shiftKey, store.zoom);
+      const paintHighlighter = () => {
+        if (!this._isPointerDown || !this._pageScratchCtx || !this._pageScratchCanvas) return;
+        const c = this._pageScratchCtx;
+        const cv = this._pageScratchCanvas;
+        const rs = store.zoom * this.renderDpr();
+        this.clearScratchpadDirty(c, cv);
+        this.withScratchOffset(c, cv, () => {
+          highlighterTool.renderScratchpad(c, rs);
+        });
+        this.setScratchpadDirtyFromPageBox(highlighterTool.getLiveBoundingBox(), rs);
+      };
+      if (this._scratchRafId === null) {
+        paintHighlighter();
+        this._scratchNeedsTrailingPaint = false;
+        this._scratchRafId = requestAnimationFrame(() => {
+          this._scratchRafId = null;
+          if (this._scratchNeedsTrailingPaint) {
+            this._scratchNeedsTrailingPaint = false;
+            paintHighlighter();
+          }
+        });
+      } else {
+        this._scratchNeedsTrailingPaint = true;
+      }
+      return;
+    }
+
+    // Clear scratchpad canvas once per frame for non-ink interactive tools
+    const activeScratch = this._pageScratchCanvas || scratchCanvas;
+    this.clearScratchpadDirty(ctx, activeScratch);
 
     switch (tool) {
       // Lasso shares Select's whole move path: an active transform drag takes
@@ -752,37 +968,17 @@ export class PointerHandler {
           }
           onNeedRepaint();
         } else if (this._lasso && this._lasso.pageIndex === pageIndex) {
-          this.growLasso(pts, pageIndex, ctx, renderScale);
+          this.withScratchOffset(ctx, activeScratch, () => {
+            this.growLasso(pts, pageIndex, ctx, renderScale);
+          });
         } else if (this._marquee && this._marquee.pageIndex === pageIndex) {
           this._marquee.current = { ...lastPt };
-          this.renderMarquee(ctx, renderScale);
+          this.withScratchOffset(ctx, activeScratch, () => {
+            this.renderMarquee(ctx, renderScale);
+          });
         }
         break;
       }
-
-      case 'pen':
-        for (const pt of pts) penTool.move(pt);
-        // Draw-and-hold: moving past the hold radius restarts (or cancels a
-        // fired preview back to ink); stillness lets the timer snap.
-        if (this._holdAnchor && Math.hypot(lastPt.x - this._holdAnchor.x, lastPt.y - this._holdAnchor.y) > PointerHandler.HOLD_RADIUS) {
-          this._holdFired = false;
-          this._holdShape = null;
-          this._morphHandle?.cancel();
-          this._morphHandle = null;
-          this.startHoldTimer({ x: lastPt.x, y: lastPt.y });
-        }
-        if (this._holdFired && this._holdShape) {
-          const preview = this.buildHoldShapeAnnotation(this._holdShape, pageIndex, 'layer-default');
-          if (preview) annotationEngine.renderSingleAnnotation(ctx, preview, renderScale);
-        } else {
-          penTool.renderScratchpad(ctx, renderScale);
-        }
-        break;
-
-      case 'highlighter':
-        for (const pt of pts) highlighterTool.move(pt, shiftKey);
-        highlighterTool.renderScratchpad(ctx, renderScale);
-        break;
 
       case 'eraser':
         eraserTool.move(lastPt);
@@ -793,7 +989,9 @@ export class PointerHandler {
         onNeedRepaint();
         // Single preview ring at the live position — drawing one per
         // coalesced sub-event left a trail of stale circles behind the cursor.
-        eraserTool.renderScratchpad(ctx, lastPt, renderScale);
+        this.withScratchOffset(ctx, activeScratch, () => {
+          eraserTool.renderScratchpad(ctx, lastPt, renderScale);
+        });
         break;
 
       case 'rectangle':
@@ -812,8 +1010,10 @@ export class PointerHandler {
           const p = magnetic ? this.snapToVertex(pt, pageIndex) : pt;
           shapesTool.move(p, shiftKey, snapAngle);
         }
-        shapesTool.renderScratchpad(ctx, renderScale);
-        if (magnetic) this.renderSnapTarget(ctx, renderScale);
+        this.withScratchOffset(ctx, activeScratch, () => {
+          shapesTool.renderScratchpad(ctx, renderScale);
+          if (magnetic) this.renderSnapTarget(ctx, renderScale);
+        });
         break;
       }
 
@@ -821,12 +1021,16 @@ export class PointerHandler {
       case 'measure-angle':
       case 'measure-area':
         for (const pt of pts) measureTool.move(pt);
-        measureTool.renderScratchpad(ctx, renderScale);
+        this.withScratchOffset(ctx, activeScratch, () => {
+          measureTool.renderScratchpad(ctx, renderScale);
+        });
         break;
 
       case 'redaction':
         for (const pt of pts) redactionTool.move(pt);
-        redactionTool.renderScratchpad(ctx, renderScale);
+        this.withScratchOffset(ctx, activeScratch, () => {
+          redactionTool.renderScratchpad(ctx, renderScale);
+        });
         break;
     }
   }
@@ -839,7 +1043,10 @@ export class PointerHandler {
   ): void {
     if (!this._isPointerDown || this._activePageIndex !== pageIndex) return;
 
+    this.cancelScratchRaf();
     this._isPointerDown = false;
+    this._activeCanvasRect = null;
+    this._scratchDirtyRect = null;
     const tool = this._strokeTool ?? store.activeTool;
     const defaultLayerId = 'layer-default';
 
@@ -847,15 +1054,19 @@ export class PointerHandler {
       this._isPointerDown = false;
       this._strokeTool = null;
       // Polygons remain active across clicks until closed or completed
-      if (this._pageScratchCtx && shapesTool.isPolygonActive()) {
-        shapesTool.renderScratchpad(this._pageScratchCtx, store.zoom * (this.renderDpr()));
+      if (this._pageScratchCtx && this._pageScratchCanvas && shapesTool.isPolygonActive()) {
+        const c = this._pageScratchCtx;
+        const cv = this._pageScratchCanvas;
+        this.withScratchOffset(c, cv, () => {
+          shapesTool.renderScratchpad(c, store.zoom * this.renderDpr());
+        });
       }
       return;
     }
 
     // Clear scratchpad canvas
-    if (this._pageScratchCtx) {
-      this._pageScratchCtx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
+    if (this._pageScratchCtx && this._pageScratchCanvas) {
+      this._pageScratchCtx.clearRect(0, 0, this._pageScratchCanvas.width, this._pageScratchCanvas.height);
     }
 
     switch (tool) {
@@ -1246,6 +1457,14 @@ export class PointerHandler {
     return this._isPointerDown;
   }
 
+  get activePageIndex(): number {
+    return this._activePageIndex;
+  }
+
+  public isPolygonActiveOnPage(pageIndex: number): boolean {
+    return shapesTool.isPolygonActive() && shapesTool.activePageIndex === pageIndex;
+  }
+
   public handleHover(e: PointerEvent, pageIndex: number, canvas: HTMLCanvasElement): void {
     if (store.selectedAnnotationIds.size === 0) return;
 
@@ -1314,6 +1533,7 @@ export class PointerHandler {
    */
   public cancelActiveStroke(): void {
     if (!this._isPointerDown) return;
+    this.cancelScratchRaf();
     const tool = this._strokeTool ?? store.activeTool;
     this.clearHoldTimer();
     this._morphHandle?.cancel();
@@ -1325,8 +1545,6 @@ export class PointerHandler {
       eraserTool.finish();
       this.commitEraserSession(this._eraserSession.pageIndex);
     } else {
-      this._zoomMarqueeStart = null;
-      this._zoomMarqueeCurrent = null;
       // A gesture takeover commits (never silently drops) a selection drag;
       // an uncommitted marquee/lasso is just a rubber band.
       this.commitSelectDrag();
@@ -1349,6 +1567,8 @@ export class PointerHandler {
     this._activePageIndex = -1;
     this._pageScratchCanvas = null;
     this._pageScratchCtx = null;
+    this._activeCanvasRect = null;
+    this._scratchDirtyRect = null;
   }
 
   private beginEraserSession(pageIndex: number): void {
@@ -1415,6 +1635,147 @@ export class PointerHandler {
     }
   }
 
+  /**
+   * Opens the floating inline text editor at `pt` to create a brand-new
+   * TextAnnotation on commit. If left empty or cancelled, nothing is added.
+   */
+  public beginNewTextAnnotation(
+    pt: Point,
+    pageIndex: number,
+    canvas: HTMLCanvasElement,
+    onNeedRepaint: () => void
+  ): void {
+    const tSettings = store.toolSettings;
+    const defaultLayerId = 'layer-default';
+    const fontSize = this.lensWidth(tSettings.fontSize || 16);
+    const fontFamily = tSettings.fontFamily || 'Inter';
+    const textColor = tSettings.textColor || '#111827';
+    const textBgColor = tSettings.textBgColor || 'transparent';
+    const textAlign = tSettings.textAlign || 'left';
+    const zoom = store.zoom;
+    const cRect = canvas.getBoundingClientRect();
+
+    const screenRect = {
+      left: cRect.left + pt.x * zoom,
+      top: cRect.top + pt.y * zoom,
+      width: Math.max(160, Math.round(180 * Math.min(2, Math.max(0.85, zoom)))),
+      height: Math.max(36, Math.round((fontSize * 1.45 + 16) * zoom))
+    };
+
+    openInlineEditor({
+      rect: screenRect,
+      value: '',
+      fontSize: fontSize * zoom,
+      fontFamily,
+      color: textColor,
+      backgroundColor: textBgColor,
+      textAlign,
+      padding: 8 * zoom,
+      placeholder: 'Type text… (Enter to finish, Shift+Enter for new line)',
+      selectAllOnOpen: false,
+      onCommit: (rawText: string) => {
+        const cleaned = rawText.replace(/\r\n/g, '\n');
+        if (cleaned.trim().length === 0) {
+          onNeedRepaint();
+          return;
+        }
+        const textAnn = textTool.createTextAnnotation(
+          pt,
+          pageIndex,
+          defaultLayerId,
+          cleaned,
+          fontSize,
+          fontFamily,
+          textColor,
+          textBgColor,
+          textAlign
+        );
+        history.execute(new AddAnnotationCommand(pageIndex, textAnn));
+        store.setActiveTool('select');
+        this.selectCreatedAnnotation(textAnn.id);
+        onNeedRepaint();
+      },
+      onCancel: () => {
+        onNeedRepaint();
+      }
+    });
+  }
+
+  /**
+   * Opens the floating inline text editor directly over an existing
+   * TextAnnotation (`ann`), hiding its canvas render while editing and
+   * committing a single `ModifyAnnotationCommand` (or deleting if emptied).
+   */
+  public editExistingTextAnnotation(
+    ann: TextAnnotation,
+    pageIndex: number,
+    canvas: HTMLCanvasElement,
+    onNeedRepaint: () => void
+  ): void {
+    const zoom = store.zoom;
+    const cRect = canvas.getBoundingClientRect();
+    const pad = ann.padding ?? 8;
+
+    const screenRect = {
+      left: cRect.left + ann.box.x * zoom,
+      top: cRect.top + ann.box.y * zoom,
+      width: Math.max(140, ann.box.width * zoom),
+      height: Math.max(34, ann.box.height * zoom)
+    };
+
+    annotationEngine.setEditingAnnotationId(ann.id);
+    onNeedRepaint();
+
+    openInlineEditor({
+      rect: screenRect,
+      value: ann.text,
+      fontSize: ann.fontSize * zoom,
+      fontFamily: ann.fontFamily || 'Inter',
+      color: ann.color || '#111827',
+      backgroundColor: ann.backgroundColor || 'transparent',
+      textAlign: ann.textAlign || 'left',
+      padding: pad * zoom,
+      selectAllOnOpen: true,
+      onCommit: (rawText: string) => {
+        annotationEngine.setEditingAnnotationId(null);
+        const cleaned = rawText.replace(/\r\n/g, '\n');
+        if (cleaned.trim().length === 0) {
+          history.execute(new DeleteAnnotationsCommand(pageIndex, [ann]));
+          store.clearSelection();
+          onNeedRepaint();
+          return;
+        }
+        if (cleaned !== ann.text) {
+          const measured = textTool.measureTextBox(
+            cleaned,
+            ann.fontSize,
+            ann.fontFamily,
+            pad,
+            ann.fontWeight,
+            ann.fontStyle
+          );
+          const next: TextAnnotation = {
+            ...ann,
+            text: cleaned,
+            box: {
+              x: ann.box.x,
+              y: ann.box.y,
+              width: measured.width,
+              height: measured.height
+            },
+            updatedAt: Date.now()
+          };
+          history.execute(new ModifyAnnotationCommand(pageIndex, ann, next));
+        }
+        onNeedRepaint();
+      },
+      onCancel: () => {
+        annotationEngine.setEditingAnnotationId(null);
+        onNeedRepaint();
+      }
+    });
+  }
+
   /** Page coordinates for events that do not draw, such as context menus. */
   public pagePointForEvent(e: MouseEvent, canvas: HTMLCanvasElement): Point {
     const rect = canvas.getBoundingClientRect();
@@ -1426,16 +1787,18 @@ export class PointerHandler {
   }
 
   private getPointInPage(e: PointerEvent, canvas: HTMLCanvasElement): StrokePoint {
-    const rect = canvas.getBoundingClientRect();
+    const rect = (this._isPointerDown && this._activeCanvasRect && this._activeCanvasRect.width > 0)
+      ? this._activeCanvasRect
+      : canvas.getBoundingClientRect();
     const zoom = store.zoom;
     const rawX = (e.clientX - rect.left) / zoom;
     const rawY = (e.clientY - rect.top) / zoom;
 
     const tSettings = store.toolSettings;
-    const now = Date.now();
+    const now = performance.now();
 
     if (e.pointerType === 'mouse' && tSettings.mousePressureSimulation) {
-      const dt = Math.max(8, now - (this._lastPointerTime || now));
+      const dt = Math.max(4, now - (this._lastPointerTime || now));
       const dist = Math.hypot(e.clientX - (this._lastPointerX || e.clientX), e.clientY - (this._lastPointerY || e.clientY));
       const speed = dist / dt; // pixels per ms
       // Faster drawing -> thinner stroke (lower pressure), slower drawing -> thicker stroke

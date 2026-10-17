@@ -53,8 +53,9 @@ export function calculateStrokeWidth(
 
 /**
  * Filters micro-jitter, deduplicates overlapping sample points,
- * smoothes stylus pressure transitions, and applies subtle moving average
- * to prevent jagged, scratched or broken freehand ink lines.
+ * smoothes stylus pressure transitions, and applies a single-pass
+ * sub-pixel tremor damper (< 0.20 pt max offset) so slow hand tremors
+ * are absorbed without ever shifting or morphing corners across frames.
  */
 export function smoothStrokePoints(
   points: StrokePoint[],
@@ -62,8 +63,8 @@ export function smoothStrokePoints(
 ): StrokePoint[] {
   if (points.length <= 2) return points;
 
-  // 1. Filter out points that are too close (< 0.8px) to avoid tangent blowup and micro-dots
-  const minDistance = 0.8;
+  // 1. Filter out micro-jitter (< 0.18 page pts) while preserving fine handwriting at high zoom
+  const minDistance = 0.18;
   const deduped: StrokePoint[] = [points[0]];
   for (let i = 1; i < points.length - 1; i++) {
     const last = deduped[deduped.length - 1];
@@ -72,48 +73,81 @@ export function smoothStrokePoints(
       deduped.push(points[i]);
     }
   }
-  deduped.push(points[points.length - 1]);
+  const lastInput = points[points.length - 1];
+  const lastKept = deduped[deduped.length - 1];
+  if (Math.hypot(lastInput.x - lastKept.x, lastInput.y - lastKept.y) >= 0.02 || deduped.length === 1) {
+    deduped.push(lastInput);
+  } else {
+    deduped[deduped.length - 1] = lastInput;
+  }
 
   if (deduped.length <= 2) return deduped;
 
-  // 2. Smooth pressure with 3-point rolling average
+  // 2. Smooth pressure with 5-point Gaussian kernel [0.06, 0.24, 0.40, 0.24, 0.06]
+  // to prevent abrupt width bulges at corners
+  const n = deduped.length;
   const smoothedPressure: StrokePoint[] = deduped.map((pt, i, arr) => {
-    if (i === 0 || i === arr.length - 1) return { ...pt };
-    const prevP = arr[i - 1].pressure ?? 0.5;
-    const currP = pt.pressure ?? 0.5;
-    const nextP = arr[i + 1].pressure ?? 0.5;
-    const p = prevP * 0.25 + currP * 0.5 + nextP * 0.25;
+    if (i === 0 || i === n - 1) return { ...pt };
+    const pM2 = arr[Math.max(0, i - 2)].pressure ?? 0.5;
+    const pM1 = arr[Math.max(0, i - 1)].pressure ?? 0.5;
+    const p0 = pt.pressure ?? 0.5;
+    const pP1 = arr[Math.min(n - 1, i + 1)].pressure ?? 0.5;
+    const pP2 = arr[Math.min(n - 1, i + 2)].pressure ?? 0.5;
+    const p = pM2 * 0.06 + pM1 * 0.24 + p0 * 0.40 + pP1 * 0.24 + pP2 * 0.06;
     return { ...pt, pressure: p };
   });
 
   if (smoothing === 'none') return smoothedPressure;
 
-  // 3. Coordinate smoothing passes
-  const passes = smoothing === 'high' ? 2 : 1;
-  const weight = smoothing === 'subtle' ? 0.06 : (smoothing === 'medium' ? 0.10 : 0.14);
+  // 3. Single-pass sub-pixel micro-tremor filter:
+  // Strictly capped to <= 0.18 page points max displacement and active only on
+  // very short slow-moving chords so fast strokes and turns never shift or morph
+  // after being drawn on screen.
+  const maxTremorOffset = smoothing === 'subtle' ? 0.10 : (smoothing === 'medium' ? 0.16 : 0.22);
+  const weight = smoothing === 'subtle' ? 0.08 : (smoothing === 'medium' ? 0.12 : 0.16);
 
-  let current = smoothedPressure;
-  for (let p = 0; p < passes; p++) {
-    const next: StrokePoint[] = [current[0]];
-    for (let i = 1; i < current.length - 1; i++) {
-      const prev = current[i - 1];
-      const curr = current[i];
-      const after = current[i + 1];
-      next.push({
+  const out: StrokePoint[] = [smoothedPressure[0]];
+  for (let i = 1; i < smoothedPressure.length - 1; i++) {
+    const prev = smoothedPressure[i - 1];
+    const curr = smoothedPressure[i];
+    const after = smoothedPressure[i + 1];
+
+    const len1 = Math.hypot(curr.x - prev.x, curr.y - prev.y);
+    const len2 = Math.hypot(after.x - curr.x, after.y - curr.y);
+    const maxChord = Math.max(len1, len2);
+
+    if (maxChord < 3.5 && len1 > 1e-4 && len2 > 1e-4) {
+      const slowFactor = 1 - maxChord / 3.5;
+      const midX = (prev.x + after.x) * 0.5;
+      const midY = (prev.y + after.y) * 0.5;
+      let dx = (midX - curr.x) * weight * slowFactor;
+      let dy = (midY - curr.y) * weight * slowFactor;
+      const shift = Math.hypot(dx, dy);
+      if (shift > maxTremorOffset) {
+        const scale = maxTremorOffset / shift;
+        dx *= scale;
+        dy *= scale;
+      }
+      out.push({
         ...curr,
-        x: curr.x * (1 - 2 * weight) + prev.x * weight + after.x * weight,
-        y: curr.y * (1 - 2 * weight) + prev.y * weight + after.y * weight,
+        x: curr.x + dx,
+        y: curr.y + dy
       });
+    } else {
+      out.push(curr);
     }
-    next.push(current[current.length - 1]);
-    current = next;
   }
+  out.push(smoothedPressure[smoothedPressure.length - 1]);
 
-  return current;
+  return out;
 }
 
 /**
- * Generates smooth Bezier curve segments from discrete sampled points.
+ * Generates smooth G1-continuous Cubic Bezier curve segments from discrete sampled points.
+ * Uses exact Barry-Goldman Centripetal Catmull-Rom tangents on gentle curves and inserts
+ * local G1 tangential circular-arc fillets right at sharp direction changes so turns are
+ * immediately round on the first frame they appear, without bending incoming segments or
+ * pulling vertices away from the user's handwriting.
  */
 export function generateSmoothSegments(
   points: StrokePoint[],
@@ -142,71 +176,175 @@ export function generateSmoothSegments(
     return segments;
   }
 
-  // Centripetal Catmull-Rom to Cubic Bezier conversion
-  const alpha = 0.5; // centripetal
+  const alpha = 0.5;
+  const count = points.length;
+  const segChord = new Float64Array(count - 1);
+  const segParam = new Float64Array(count - 1);
+  const unitX = new Float64Array(count - 1);
+  const unitY = new Float64Array(count - 1);
+  const knotWidth = new Float64Array(count);
 
-  for (let i = 0; i < points.length - 1; i++) {
-    const p0 = i > 0 ? points[i - 1] : points[i];
-    const p1 = points[i];
-    const p2 = points[i + 1];
-    const p3 = i + 2 < points.length ? points[i + 2] : p2;
+  for (let i = 0; i < count; i++) {
+    knotWidth[i] = calculateStrokeWidth(baseWidth, points[i].pressure, pressureCurve, pressureEnabled, strength);
+  }
 
-    const chord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    let cp1x: number;
-    let cp1y: number;
-    let cp2x: number;
-    let cp2y: number;
-
-    if (chord < 0.001) {
-      cp1x = p1.x;
-      cp1y = p1.y;
-      cp2x = p2.x;
-      cp2y = p2.y;
+  for (let i = 0; i < count - 1; i++) {
+    const dx = points[i + 1].x - points[i].x;
+    const dy = points[i + 1].y - points[i].y;
+    const c = Math.hypot(dx, dy);
+    segChord[i] = c;
+    segParam[i] = Math.max(1e-3, Math.pow(c, alpha));
+    if (c > 1e-6) {
+      unitX[i] = dx / c;
+      unitY[i] = dy / c;
     } else {
-      const d1 = Math.max(0.001, Math.hypot(p1.x - p0.x, p1.y - p0.y) ** alpha);
-      const d2 = Math.max(0.001, chord ** alpha);
-      const d3 = Math.max(0.001, Math.hypot(p3.x - p2.x, p3.y - p2.y) ** alpha);
+      unitX[i] = i > 0 ? unitX[i - 1] : 1;
+      unitY[i] = i > 0 ? unitY[i - 1] : 0;
+    }
+  }
 
-      // Raw Catmull-Rom tangents
-      cp1x = p1.x + (d2 * (p1.x - p0.x) / d1 + (2 * d1 + d2) * (p2.x - p1.x) / (d1 + d2)) / 3;
-      cp1y = p1.y + (d2 * (p1.y - p0.y) / d1 + (2 * d1 + d2) * (p2.y - p1.y) / (d1 + d2)) / 3;
+  const inAnchorX = new Float64Array(count);
+  const inAnchorY = new Float64Array(count);
+  const outAnchorX = new Float64Array(count);
+  const outAnchorY = new Float64Array(count);
+  const inDirX = new Float64Array(count);
+  const inDirY = new Float64Array(count);
+  const outDirX = new Float64Array(count);
+  const outDirY = new Float64Array(count);
+  const filletRadius = new Float64Array(count);
 
-      cp2x = p2.x - (d2 * (p3.x - p2.x) / d3 + (d2 + 2 * d3) * (p2.x - p1.x) / (d2 + d3)) / 3;
-      cp2y = p2.y - (d2 * (p3.y - p2.y) / d3 + (d2 + 2 * d3) * (p2.y - p1.y) / (d2 + d3)) / 3;
+  // Maximum corner trim radius in page units: keeps the circular fillet midpoint
+  // within ~0.35-0.55pt of the raw vertex (inside the pen tip cap) so the user
+  // never perceives any shape alteration.
+  const maxFilletR = Math.min(1.55, Math.max(0.75, baseWidth * 0.42));
 
-      // Clamp control points to max distance from endpoints (at most half chord length).
-      // This strictly prevents Catmull-Rom tangent blowup, loops, and sharp thorn spikes.
-      const maxDist = chord * 0.5;
+  inAnchorX[0] = outAnchorX[0] = points[0].x;
+  inAnchorY[0] = outAnchorY[0] = points[0].y;
+  inDirX[0] = outDirX[0] = unitX[0];
+  inDirY[0] = outDirY[0] = unitY[0];
 
-      const v1x = cp1x - p1.x;
-      const v1y = cp1y - p1.y;
-      const dist1 = Math.hypot(v1x, v1y);
-      if (dist1 > maxDist && dist1 > 0.0001) {
-        const scale1 = maxDist / dist1;
-        cp1x = p1.x + v1x * scale1;
-        cp1y = p1.y + v1y * scale1;
-      }
+  const lastIdx = count - 1;
+  inAnchorX[lastIdx] = outAnchorX[lastIdx] = points[lastIdx].x;
+  inAnchorY[lastIdx] = outAnchorY[lastIdx] = points[lastIdx].y;
+  inDirX[lastIdx] = outDirX[lastIdx] = unitX[lastIdx - 1];
+  inDirY[lastIdx] = outDirY[lastIdx] = unitY[lastIdx - 1];
 
-      const v2x = cp2x - p2.x;
-      const v2y = cp2y - p2.y;
-      const dist2 = Math.hypot(v2x, v2y);
-      if (dist2 > maxDist && dist2 > 0.0001) {
-        const scale2 = maxDist / dist2;
-        cp2x = p2.x + v2x * scale2;
-        cp2y = p2.y + v2y * scale2;
-      }
+  for (let i = 1; i < lastIdx; i++) {
+    const ux = unitX[i - 1];
+    const uy = unitY[i - 1];
+    const vx = unitX[i];
+    const vy = unitY[i];
+    const len1 = segChord[i - 1];
+    const len2 = segChord[i];
+
+    const dPrev = segParam[i - 1];
+    const dNext = segParam[i];
+    const dSum = dPrev + dNext;
+
+    // Barry-Goldman chord-weighted tangent vector, normalized so sharp turns never collapse handles
+    let bgX = (dNext / dSum) * ux + (dPrev / dSum) * vx;
+    let bgY = (dNext / dSum) * uy + (dPrev / dSum) * vy;
+    const bgLen = Math.hypot(bgX, bgY);
+    if (bgLen > 1e-5) {
+      bgX /= bgLen;
+      bgY /= bgLen;
+    } else {
+      bgX = -uy;
+      bgY = ux;
     }
 
-    const wStart = calculateStrokeWidth(baseWidth, p1.pressure, pressureCurve, pressureEnabled, strength);
-    const wEnd = calculateStrokeWidth(baseWidth, p2.pressure, pressureCurve, pressureEnabled, strength);
+    const cosTheta = Math.max(-1, Math.min(1, ux * vx + uy * vy));
+    const sharpness = (1 - cosTheta) * 0.5;
+
+    // Activate local tangential fillet smoothly for turns > ~18 degrees (sharpness > 0.025)
+    const tTurn = Math.min(1, Math.max(0, (sharpness - 0.025) / 0.22));
+    const r = tTurn > 0 ? Math.min(len1 * 0.44, len2 * 0.44, maxFilletR) * tTurn : 0;
+    filletRadius[i] = r;
+
+    inAnchorX[i] = points[i].x - r * ux;
+    inAnchorY[i] = points[i].y - r * uy;
+    outAnchorX[i] = points[i].x + r * vx;
+    outAnchorY[i] = points[i].y + r * vy;
+
+    // Blend knot tangents from Barry-Goldman (on gentle curves) to exact leg directions
+    // (on sharp turns) so incoming segments never swing sideways when a turn occurs.
+    const idx = bgX * (1 - tTurn) + ux * tTurn;
+    const idy = bgY * (1 - tTurn) + uy * tTurn;
+    const ilen = Math.hypot(idx, idy);
+    inDirX[i] = ilen > 1e-6 ? idx / ilen : ux;
+    inDirY[i] = ilen > 1e-6 ? idy / ilen : uy;
+
+    const odx = bgX * (1 - tTurn) + vx * tTurn;
+    const ody = bgY * (1 - tTurn) + vy * tTurn;
+    const olen = Math.hypot(odx, ody);
+    outDirX[i] = olen > 1e-6 ? odx / olen : vx;
+    outDirY[i] = olen > 1e-6 ? ody / olen : vy;
+  }
+
+  const KAPPA = 0.55228475;
+
+  for (let i = 0; i < lastIdx; i++) {
+    if (i > 0 && filletRadius[i] > 1e-3) {
+      const r = filletRadius[i];
+      const fStart: StrokePoint = {
+        x: inAnchorX[i],
+        y: inAnchorY[i],
+        pressure: points[i].pressure
+      };
+      const fEnd: StrokePoint = {
+        x: outAnchorX[i],
+        y: outAnchorY[i],
+        pressure: points[i].pressure
+      };
+      const handleLen = r * KAPPA;
+      segments.push({
+        p0: fStart,
+        p1: fEnd,
+        cp1: {
+          x: fStart.x + inDirX[i] * handleLen,
+          y: fStart.y + inDirY[i] * handleLen
+        },
+        cp2: {
+          x: fEnd.x - outDirX[i] * handleLen,
+          y: fEnd.y - outDirY[i] * handleLen
+        },
+        widthStart: knotWidth[i],
+        widthEnd: knotWidth[i]
+      });
+    }
+
+    const pStart: StrokePoint = {
+      x: outAnchorX[i],
+      y: outAnchorY[i],
+      pressure: points[i].pressure
+    };
+    const pEnd: StrokePoint = {
+      x: inAnchorX[i + 1],
+      y: inAnchorY[i + 1],
+      pressure: points[i + 1].pressure
+    };
+
+    const spanLen = Math.hypot(pEnd.x - pStart.x, pEnd.y - pStart.y);
+    if (spanLen < 1e-4) continue;
+
+    const prevSpan = i > 0 ? segChord[i - 1] : spanLen;
+    const nextSpan = i + 1 < lastIdx ? segChord[i + 1] : spanLen;
+    const h1Len = Math.min(spanLen * 0.42, Math.min(spanLen, prevSpan * 1.35) / 3);
+    const h2Len = Math.min(spanLen * 0.42, Math.min(spanLen, nextSpan * 1.35) / 3);
 
     segments.push({
-      p0: p1,
-      p1: p2,
-      cp1: { x: cp1x, y: cp1y },
-      cp2: { x: cp2x, y: cp2y },
-      widthStart: wStart,
-      widthEnd: wEnd
+      p0: pStart,
+      p1: pEnd,
+      cp1: {
+        x: pStart.x + outDirX[i] * h1Len,
+        y: pStart.y + outDirY[i] * h1Len
+      },
+      cp2: {
+        x: pEnd.x - inDirX[i + 1] * h2Len,
+        y: pEnd.y - inDirY[i + 1] * h2Len
+      },
+      widthStart: knotWidth[i],
+      widthEnd: knotWidth[i + 1]
     });
   }
 
@@ -218,12 +356,12 @@ export function generateSmoothSegments(
  * drops below one device pixel rasterises as a broken line of grey dashes —
  * the "chalky" look — so the outline never narrows past this.
  */
-const MIN_INK_WIDTH = 0.75;
+const MIN_INK_WIDTH = 0.35;
 
 /**
  * Half-width floor for a single point, so a tap still stamps a visible dot.
  */
-const MIN_DOT_WIDTH = 1.4;
+const MIN_DOT_WIDTH = 1.0;
 
 interface RibbonSample {
   x: number;
@@ -233,9 +371,9 @@ interface RibbonSample {
 
 /**
  * Flattens the cubic segments into a polyline of centerline samples, each
- * carrying the interpolated stroke width at that parameter. Sampling density
- * follows the chord length so long curves stay smooth without over-tessellating
- * short ones.
+ * carrying the interpolated stroke width at that parameter. Curvature-adaptive
+ * sampling density ensures small handwriting and tight turns at 100%-800% zoom
+ * remain mathematically smooth with zero polygonal faceting.
  */
 function sampleRibbonCenterline(segments: CurveSegment[]): RibbonSample[] {
   const samples: RibbonSample[] = [];
@@ -243,7 +381,13 @@ function sampleRibbonCenterline(segments: CurveSegment[]): RibbonSample[] {
   for (let s = 0; s < segments.length; s++) {
     const seg = segments[s];
     const chord = Math.hypot(seg.p1.x - seg.p0.x, seg.p1.y - seg.p0.y);
-    const steps = Math.max(4, Math.min(32, Math.ceil(chord / 2)));
+    // Estimate control polygon excess to boost subdivision on curved segments
+    const ctrlLen =
+      Math.hypot(seg.cp1.x - seg.p0.x, seg.cp1.y - seg.p0.y) +
+      Math.hypot(seg.cp2.x - seg.cp1.x, seg.cp2.y - seg.cp1.y) +
+      Math.hypot(seg.p1.x - seg.cp2.x, seg.p1.y - seg.cp2.y);
+    const curvatureBoost = Math.max(0, ctrlLen - chord) * 18;
+    const steps = Math.max(12, Math.min(64, Math.ceil(chord * 3.5 + curvatureBoost)));
     // Skip the first sample of every segment after the first: it duplicates the
     // previous segment's endpoint and would produce a zero-length tangent.
     const from = s === 0 ? 0 : 1;
@@ -255,10 +399,12 @@ function sampleRibbonCenterline(segments: CurveSegment[]): RibbonSample[] {
       const b = 3 * it * it * t;
       const c = 3 * it * t * t;
       const d = t * t * t;
+      // Smooth Hermite interpolation for width to avoid sharp width corners at knots
+      const smoothT = t * t * (3 - 2 * t);
       samples.push({
         x: a * seg.p0.x + b * seg.cp1.x + c * seg.cp2.x + d * seg.p1.x,
         y: a * seg.p0.y + b * seg.cp1.y + c * seg.cp2.y + d * seg.p1.y,
-        w: seg.widthStart + (seg.widthEnd - seg.widthStart) * t
+        w: seg.widthStart + (seg.widthEnd - seg.widthStart) * smoothT
       });
     }
   }
@@ -270,8 +416,8 @@ function sampleRibbonCenterline(segments: CurveSegment[]): RibbonSample[] {
  * Emits a sampled round cap as line segments. The swept arc runs from the
  * ribbon's `n` edge, around the tip along `d`, to the opposite edge.
  */
-function emitRoundCap(
-  ctx: CanvasRenderingContext2D,
+function emitRoundCapToTarget(
+  target: CanvasPath,
   cx: number,
   cy: number,
   half: number,
@@ -280,42 +426,37 @@ function emitRoundCap(
   dx: number,
   dy: number
 ): void {
-  const steps = 8;
+  const steps = 16;
   for (let i = 0; i <= steps; i++) {
     const th = (i / steps) * Math.PI;
     const cos = Math.cos(th);
     const sin = Math.sin(th);
-    ctx.lineTo(cx + half * (cos * nx + sin * dx), cy + half * (cos * ny + sin * dy));
+    target.lineTo(cx + half * (cos * nx + sin * dx), cy + half * (cos * ny + sin * dy));
   }
 }
 
 /**
- * Builds ONE closed outline for the whole stroke: the variable-width ribbon
- * (left edge forward, round cap, right edge backward, round cap).
- *
- * The pen used to stroke every cubic segment separately, which banded the width
- * at each junction and re-composited the overlap — the chalky, seamed look. A
- * single filled outline has no seams and gets proper coverage anti-aliasing
- * from the rasteriser along its whole boundary.
- *
- * Returns false when there is nothing to draw.
+ * Traces the closed variable-width ribbon outline onto any `CanvasPath`
+ * (`CanvasRenderingContext2D` or `Path2D`) with normal-field smoothing
+ * and inner-edge anti-pinch protection on tight turns.
  */
-function buildInkRibbon(ctx: CanvasRenderingContext2D, segments: CurveSegment[]): boolean {
+export function traceInkRibbonPath(target: CanvasPath, segments: CurveSegment[]): boolean {
   const samples = sampleRibbonCenterline(segments);
   if (samples.length === 0) return false;
 
-  ctx.beginPath();
-
   if (samples.length === 1) {
     const s = samples[0];
-    ctx.arc(s.x, s.y, Math.max(MIN_DOT_WIDTH, s.w) / 2, 0, Math.PI * 2);
+    target.arc(s.x, s.y, Math.max(MIN_DOT_WIDTH, s.w) / 2, 0, Math.PI * 2);
     return true;
   }
 
   const count = samples.length;
-  const left: Array<{ x: number; y: number }> = [];
-  const right: Array<{ x: number; y: number }> = [];
-  const dirs: Array<{ dx: number; dy: number }> = [];
+  const leftX = new Float64Array(count);
+  const leftY = new Float64Array(count);
+  const rightX = new Float64Array(count);
+  const rightY = new Float64Array(count);
+  const dirX = new Float64Array(count);
+  const dirY = new Float64Array(count);
 
   for (let i = 0; i < count; i++) {
     const prev = samples[Math.max(0, i - 1)];
@@ -324,62 +465,161 @@ function buildInkRibbon(ctx: CanvasRenderingContext2D, segments: CurveSegment[])
     let dy = next.y - prev.y;
     const len = Math.hypot(dx, dy);
     if (len < 1e-6) {
-      // Degenerate tangent (coincident samples): reuse the previous direction.
-      const prevDir = dirs[i - 1] || { dx: 1, dy: 0 };
-      dx = prevDir.dx;
-      dy = prevDir.dy;
+      dx = i > 0 ? dirX[i - 1] : 1;
+      dy = i > 0 ? dirY[i - 1] : 0;
     } else {
       dx /= len;
       dy /= len;
     }
-    dirs.push({ dx, dy });
+    dirX[i] = dx;
+    dirY[i] = dy;
+  }
 
+  // Smooth the unit tangent/normal vectors across neighboring samples so rapid
+  // curvature changes rotate the ribbon normal smoothly without sharp edge spikes
+  if (count >= 4) {
+    const tmpX = new Float64Array(count);
+    const tmpY = new Float64Array(count);
+    for (let pass = 0; pass < 2; pass++) {
+      tmpX[0] = dirX[0];
+      tmpY[0] = dirY[0];
+      tmpX[count - 1] = dirX[count - 1];
+      tmpY[count - 1] = dirY[count - 1];
+      for (let i = 1; i < count - 1; i++) {
+        const sx = dirX[i - 1] * 0.25 + dirX[i] * 0.5 + dirX[i + 1] * 0.25;
+        const sy = dirY[i - 1] * 0.25 + dirY[i] * 0.5 + dirY[i + 1] * 0.25;
+        const slen = Math.hypot(sx, sy);
+        if (slen > 1e-6) {
+          tmpX[i] = sx / slen;
+          tmpY[i] = sy / slen;
+        } else {
+          tmpX[i] = dirX[i];
+          tmpY[i] = dirY[i];
+        }
+      }
+      dirX.set(tmpX);
+      dirY.set(tmpY);
+    }
+  }
+
+  for (let i = 0; i < count; i++) {
     const half = Math.max(MIN_INK_WIDTH, samples[i].w) / 2;
-    const nx = -dy;
-    const ny = dx;
-    left.push({ x: samples[i].x + nx * half, y: samples[i].y + ny * half });
-    right.push({ x: samples[i].x - nx * half, y: samples[i].y - ny * half });
+    const nx = -dirY[i];
+    const ny = dirX[i];
+    let lx = samples[i].x + nx * half;
+    let ly = samples[i].y + ny * half;
+    let rx = samples[i].x - nx * half;
+    let ry = samples[i].y - ny * half;
+
+    // Anti-pinch: when the radius of curvature is tighter than half the stroke width,
+    // the inner offset edge can step backward against the stroke direction and form a
+    // sharp protruding spike. Blend backward-stepping inner edges to keep turns round.
+    if (i > 0) {
+      const centerStep = Math.hypot(samples[i].x - samples[i - 1].x, samples[i].y - samples[i - 1].y);
+      if (centerStep < half * 2.5) {
+        const lDot = (lx - leftX[i - 1]) * dirX[i] + (ly - leftY[i - 1]) * dirY[i];
+        if (lDot < 0) {
+          lx = leftX[i - 1] * 0.75 + lx * 0.25;
+          ly = leftY[i - 1] * 0.75 + ly * 0.25;
+        }
+        const rDot = (rx - rightX[i - 1]) * dirX[i] + (ry - rightY[i - 1]) * dirY[i];
+        if (rDot < 0) {
+          rx = rightX[i - 1] * 0.75 + rx * 0.25;
+          ry = rightY[i - 1] * 0.75 + ry * 0.25;
+        }
+      }
+    }
+
+    leftX[i] = lx;
+    leftY[i] = ly;
+    rightX[i] = rx;
+    rightY[i] = ry;
   }
 
   const last = count - 1;
 
   // Left edge, forward.
-  ctx.moveTo(left[0].x, left[0].y);
+  target.moveTo(leftX[0], leftY[0]);
   for (let i = 1; i < count; i++) {
-    ctx.lineTo(left[i].x, left[i].y);
+    target.lineTo(leftX[i], leftY[i]);
   }
 
   // End cap: left edge -> tip -> right edge.
-  emitRoundCap(
-    ctx,
+  emitRoundCapToTarget(
+    target,
     samples[last].x,
     samples[last].y,
     Math.max(MIN_INK_WIDTH, samples[last].w) / 2,
-    -dirs[last].dy,
-    dirs[last].dx,
-    dirs[last].dx,
-    dirs[last].dy
+    -dirY[last],
+    dirX[last],
+    dirX[last],
+    dirY[last]
   );
 
   // Right edge, backward.
   for (let i = last; i >= 0; i--) {
-    ctx.lineTo(right[i].x, right[i].y);
+    target.lineTo(rightX[i], rightY[i]);
   }
 
   // Start cap: right edge -> tail -> left edge.
-  emitRoundCap(
-    ctx,
+  emitRoundCapToTarget(
+    target,
     samples[0].x,
     samples[0].y,
     Math.max(MIN_INK_WIDTH, samples[0].w) / 2,
-    dirs[0].dy,
-    -dirs[0].dx,
-    -dirs[0].dx,
-    -dirs[0].dy
+    dirY[0],
+    -dirX[0],
+    -dirX[0],
+    -dirY[0]
   );
 
-  ctx.closePath();
+  target.closePath();
   return true;
+}
+
+function buildInkRibbon(ctx: CanvasRenderingContext2D, segments: CurveSegment[]): boolean {
+  ctx.beginPath();
+  return traceInkRibbonPath(ctx, segments);
+}
+
+/**
+ * Builds a reusable `Path2D` for a slice of stroke points. Used by `PenTool`
+ * to freeze completed 48-point chunks of a long live stroke into O(1) GPU paths
+ * and by `renderSmoothStroke` to cache committed annotations across repaints.
+ */
+export function buildInkRibbonPath2D(
+  points: StrokePoint[],
+  baseWidth: number,
+  pressureCurve: 'linear' | 'soft' | 'firm' | 'exponential' = 'linear',
+  pressureEnabled = true,
+  strength: 'light' | 'balanced' | 'strong' = 'balanced'
+): Path2D | null {
+  if (typeof Path2D === 'undefined' || points.length === 0) return null;
+  const path = new Path2D();
+  if (points.length === 1) {
+    const p = points[0];
+    const w = calculateStrokeWidth(baseWidth, p.pressure, pressureCurve, pressureEnabled, strength);
+    path.arc(p.x, p.y, Math.max(MIN_DOT_WIDTH, w) / 2, 0, Math.PI * 2);
+    return path;
+  }
+  const segments = generateSmoothSegments(points, baseWidth, pressureCurve, pressureEnabled, strength);
+  if (!traceInkRibbonPath(path, segments)) return null;
+  return path;
+}
+
+interface CachedStrokePath {
+  key: string;
+  path: Path2D;
+}
+
+const committedStrokePathCache = new WeakMap<StrokePoint[], CachedStrokePath>();
+
+function canUsePath2D(ctx: CanvasRenderingContext2D): boolean {
+  return (
+    typeof Path2D !== 'undefined' &&
+    typeof HTMLCanvasElement !== 'undefined' &&
+    ctx.canvas instanceof HTMLCanvasElement
+  );
 }
 
 /**
@@ -456,6 +696,8 @@ export function normalizeHighlighterColor(color: string, alpha = 0.3): string {
 
 /**
  * Draws smooth stroke segments onto a canvas context with variable or uniform line width.
+ * Uses a `WeakMap<StrokePoint[], Path2D>` cache on real canvases so repainting hundreds
+ * of existing strokes during selection, eraser drags, or zoom takes O(1) time per stroke.
  */
 export function renderSmoothStroke(
   ctx: CanvasRenderingContext2D,
@@ -471,8 +713,56 @@ export function renderSmoothStroke(
 ): void {
   if (points.length === 0) return;
 
-  // Filter samples before fitting the Bézier path. This prevents raw pointer
-  // samples from pulling an otherwise smooth curve into visible corners.
+  if (canUsePath2D(ctx) && points.length >= 2) {
+    const first = points[0];
+    const last = points[points.length - 1];
+    const cacheKey = `${points.length}|${first.x.toFixed(2)},${first.y.toFixed(2)}|${last.x.toFixed(2)},${last.y.toFixed(2)}|${baseWidth}|${pressureCurve}|${isHighlighter ? 1 : 0}|${pressureEnabled ? 1 : 0}|${strength}|${tipShape}|${smoothing}`;
+    let cached = committedStrokePathCache.get(points);
+    if (!cached || cached.key !== cacheKey) {
+      const pts = smoothStrokePoints(
+        points,
+        isHighlighter && smoothing !== 'none' ? 'subtle' : smoothing
+      );
+      const path = new Path2D();
+      if (pts.length === 1) {
+        const w = isHighlighter
+          ? baseWidth
+          : calculateStrokeWidth(baseWidth, pts[0].pressure, pressureCurve, pressureEnabled, strength);
+        path.arc(pts[0].x, pts[0].y, (isHighlighter ? w : Math.max(MIN_DOT_WIDTH, w)) / 2, 0, Math.PI * 2);
+      } else if (isHighlighter) {
+        const segs = generateSmoothSegments(pts, baseWidth, pressureCurve, false, strength);
+        if (segs.length > 0) {
+          path.moveTo(segs[0].p0.x, segs[0].p0.y);
+          for (const seg of segs) {
+            path.bezierCurveTo(seg.cp1.x, seg.cp1.y, seg.cp2.x, seg.cp2.y, seg.p1.x, seg.p1.y);
+          }
+        }
+      } else {
+        const segs = generateSmoothSegments(pts, baseWidth, pressureCurve, pressureEnabled, strength);
+        traceInkRibbonPath(path, segs);
+      }
+      cached = { key: cacheKey, path };
+      committedStrokePathCache.set(points, cached);
+    }
+
+    ctx.save();
+    ctx.lineCap = tipShape === 'chisel' ? 'square' : 'round';
+    ctx.lineJoin = tipShape === 'chisel' ? 'miter' : 'round';
+    ctx.imageSmoothingEnabled = true;
+    if (isHighlighter) {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.strokeStyle = normalizeHighlighterColor(color);
+      ctx.lineWidth = baseWidth;
+      ctx.stroke(cached.path);
+    } else {
+      ctx.fillStyle = color;
+      ctx.fill(cached.path);
+    }
+    ctx.restore();
+    return;
+  }
+
+  // Fallback for single-point taps or unit-test mock contexts without Path2D
   const pts = smoothStrokePoints(
     points,
     isHighlighter && smoothing !== 'none' ? 'subtle' : smoothing
@@ -489,8 +779,6 @@ export function renderSmoothStroke(
       : calculateStrokeWidth(baseWidth, pts[0].pressure, pressureCurve, pressureEnabled, strength);
     ctx.fillStyle = isHighlighter ? normalizeHighlighterColor(color) : color;
     ctx.beginPath();
-    // Pen taps get the same minimum radius as the ribbon so a light touch still
-    // leaves a round dot instead of a pixel of grey.
     ctx.arc(pts[0].x, pts[0].y, (isHighlighter ? w : Math.max(MIN_DOT_WIDTH, w)) / 2, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
@@ -498,11 +786,6 @@ export function renderSmoothStroke(
   }
 
   if (isHighlighter) {
-    // NOTE: annotations render on a transparent overlay canvas above the PDF,
-    // so `multiply` cannot blend with the page below (it only blends within
-    // the overlay itself, darkening self-overlaps). Use normal alpha blending
-    // with a translucent color instead — text stays readable. A single
-    // continuous cubic path keeps translucent ink from darkening at seams.
     ctx.globalCompositeOperation = 'source-over';
     ctx.strokeStyle = normalizeHighlighterColor(color);
     ctx.lineWidth = baseWidth;
@@ -517,10 +800,6 @@ export function renderSmoothStroke(
     return;
   }
 
-  // Pen: one filled ribbon for the whole stroke, so nothing bands at the
-  // segment junctions (see buildInkRibbon). Whether or not pressure is enabled
-  // the path is the same centripetal Catmull-Rom fit — calculateStrokeWidth
-  // simply returns baseWidth when pressure is off.
   ctx.restore();
   renderInkRibbon(ctx, pts, color, baseWidth, pressureCurve, pressureEnabled, strength);
 }

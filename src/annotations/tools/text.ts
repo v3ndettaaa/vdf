@@ -6,6 +6,65 @@
 import { Point, TextAnnotation, BoundingBox } from '../../core/types';
 
 export class TextTool {
+  private _measureCtx: CanvasRenderingContext2D | null = null;
+
+  private getMeasureContext(): CanvasRenderingContext2D | null {
+    if (this._measureCtx) return this._measureCtx;
+    if (typeof document !== 'undefined') {
+      try {
+        const canvas = document.createElement('canvas');
+        this._measureCtx = canvas.getContext('2d');
+      } catch (_) {
+        this._measureCtx = null;
+      }
+    }
+    return this._measureCtx;
+  }
+
+  /**
+   * Computes exact page-unit bounding box dimensions for a single or multiline
+   * text string at the given font size, family, and padding.
+   */
+  public measureTextBox(
+    text: string,
+    fontSize: number = 16,
+    fontFamily: string = 'Inter',
+    padding: number = 8,
+    fontWeight: string = 'normal',
+    fontStyle: string = 'normal'
+  ): { width: number; height: number } {
+    const rawLines = (text || ' ').split('\n');
+    const lines = rawLines.length > 0 ? rawLines : [' '];
+    const lineHeight = fontSize * 1.35;
+    const ctx = this.getMeasureContext();
+    if (ctx) {
+      ctx.font = `${fontStyle || 'normal'} ${fontWeight || 'normal'} ${fontSize}px "${fontFamily}", sans-serif`;
+    }
+
+    let maxLineWidth = 0;
+    for (const line of lines) {
+      const sample = line.length > 0 ? line : ' ';
+      let w = 0;
+      if (ctx) {
+        const m = ctx.measureText(sample);
+        if (m && Number.isFinite(m.width) && m.width > 0) {
+          w = m.width;
+        }
+      }
+      if (w <= 0) {
+        w = sample.length * (fontSize * 0.58);
+      }
+      if (w > maxLineWidth) maxLineWidth = w;
+    }
+
+    const width = Math.max(48, Math.ceil(maxLineWidth + padding * 2 + 8));
+    const height = Math.max(
+      Math.ceil(lineHeight + padding * 2),
+      Math.ceil(lines.length * lineHeight + padding * 2)
+    );
+    return { width, height };
+  }
+
   public createTextAnnotation(
     point: Point,
     pageIndex: number,
@@ -17,14 +76,14 @@ export class TextTool {
     bgColor: string = 'transparent',
     align: 'left' | 'center' | 'right' = 'left'
   ): TextAnnotation {
-    const estimatedWidth = Math.max(160, initialText.length * (fontSize * 0.6) + 24);
-    const estimatedHeight = fontSize * 1.8 + 16;
+    const padding = 8;
+    const measured = this.measureTextBox(initialText, fontSize, fontFamily, padding);
 
     const box: BoundingBox = {
       x: point.x,
       y: point.y,
-      width: estimatedWidth,
-      height: estimatedHeight
+      width: measured.width,
+      height: measured.height
     };
 
     return {
@@ -39,7 +98,7 @@ export class TextTool {
       color,
       backgroundColor: bgColor,
       textAlign: align,
-      padding: 8,
+      padding,
       opacity: 1.0,
       createdAt: Date.now(),
       updatedAt: Date.now()

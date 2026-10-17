@@ -8,6 +8,7 @@ import { t } from '../i18n';
 
 export class ShortcutsModalComponent {
   private _container: HTMLElement;
+  private _wasOpen: boolean = false;
 
   constructor(container: HTMLElement) {
     this._container = container;
@@ -16,9 +17,16 @@ export class ShortcutsModalComponent {
 
   public render(): void {
     if (!store.shortcutsModalOpen) {
-      this._container.innerHTML = '';
+      if (this._wasOpen) {
+        this._wasOpen = false;
+        this._container.innerHTML = '';
+      }
       return;
     }
+    if (this._wasOpen && this._container.querySelector('#shortcuts-overlay')) {
+      return;
+    }
+    this._wasOpen = true;
 
     // Grouped so the reference scans by purpose rather than as one long list.
     const groups: Array<{ title: string; icon: string; items: Array<{ key: string; desc: string }> }> = [

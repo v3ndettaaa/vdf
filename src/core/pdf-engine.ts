@@ -9,7 +9,7 @@ import { importNativeAnnotations, stripImportedNativeAnnotations } from './nativ
 import { PageInfo, PDFBookmarkItem, PenAnnotation, StrokePoint } from './types';
 import { extensionApi } from '../utils/browser-compat';
 import { store } from './store';
-import { MAX_RENDER_DIMENSION, resolveRenderDpr } from '../utils/dpi';
+import { ADAPTIVE_CANVAS_MAX_DIMENSION, ADAPTIVE_CANVAS_MAX_PIXELS, resolveAdaptiveCanvasDpr, resolveRenderDpr } from '../utils/dpi';
 import { stripNativeInkAnnotationsFromBytes } from './native-ink';
 
 /** Backing-store multiplier over CSS pixels for the current target DPI. */
@@ -21,13 +21,27 @@ function effectiveDpr(): number {
   }
 }
 
-// Configure offline worker
-try {
-  const workerUrl = extensionApi.runtime.getURL('pdf.worker.min.mjs');
-  pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-} catch (e) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.mjs';
+function resolveAssetUrl(path: string): string {
+  try {
+    const extUrl = extensionApi.runtime.getURL(path);
+    if (extUrl && extUrl !== path) {
+      return extUrl;
+    }
+  } catch (_) {
+    // ignore
+  }
+  if (typeof window !== 'undefined' && window.location?.href) {
+    try {
+      return new URL(path || './', window.location.href).href;
+    } catch (_) {
+      // ignore
+    }
+  }
+  return path ? `./${path.replace(/^\.?\//, '')}` : './';
 }
+
+// Configure offline worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = resolveAssetUrl('pdf.worker.min.mjs');
 
 export interface RenderTaskToken {
   cancel(): void;
@@ -62,6 +76,7 @@ export class PDFEngine {
   private _pdfDoc: pdfjsLib.PDFDocumentProxy | null = null;
   private _pageCache: Map<number, pdfjsLib.PDFPageProxy> = new Map();
   private _activeRenderTasks: Map<number, any> = new Map();
+  private _activeChunkTasks: Map<number, any> = new Map();
   private _renderedBitmaps = new Map<string, CachedBitmap>();
   private _docSessions: Map<string, CachedDocSession> = new Map();
   private _currentDocId: string | null = null;
@@ -142,9 +157,7 @@ export class PDFEngine {
       dataCopy = new Uint8Array(await renderDocument.save());
     }
 
-    const localBase = (() => {
-      try { return extensionApi.runtime.getURL(''); } catch (_) { return './'; }
-    })();
+    const localBase = resolveAssetUrl('');
     const loadingTask = pdfjsLib.getDocument({
       data: dataCopy,
       // Bundled locally (vite copies cmaps/ + standard_fonts/) so offline
@@ -315,9 +328,7 @@ export class PDFEngine {
     const results: Array<{ pageIndex: number; annotation: PenAnnotation }> = [];
     let loadingTask: pdfjsLib.PDFDocumentLoadingTask | null = null;
     try {
-      const localBase = (() => {
-        try { return extensionApi.runtime.getURL(''); } catch (_) { return './'; }
-      })();
+      const localBase = resolveAssetUrl('');
       loadingTask = pdfjsLib.getDocument({
         data: bytes.slice(0),
         cMapUrl: `${localBase}cmaps/`,
@@ -414,9 +425,27 @@ export class PDFEngine {
       }
       this._activeRenderTasks.delete(pageIndex);
     }
+    this.cancelPageChunkRender(pageIndex);
+  }
+
+  public cancelPageChunkRender(pageIndex: number): void {
+    if (this._activeChunkTasks.has(pageIndex)) {
+      try {
+        this._activeChunkTasks.get(pageIndex).cancel();
+      } catch (e) {
+        // ignored
+      }
+      this._activeChunkTasks.delete(pageIndex);
+    }
   }
 
   public clearBitmapCache(): void {
+    for (const [, entry] of this._renderedBitmaps) {
+      if (entry.canvas) {
+        entry.canvas.width = 1;
+        entry.canvas.height = 1;
+      }
+    }
     this._renderedBitmaps.clear();
   }
 
@@ -439,6 +468,21 @@ export class PDFEngine {
     const renderDocId = this._currentDocId;
 
     const dpr = effectiveDpr();
+    const totalRotation = ((rotation || 0) % 360 + 360) % 360;
+
+    // Fast path: if we already have an exact cached bitmap for this page/scale/rotation,
+    // blit it synchronously without waiting for any async work.
+    const exactKey = bitmapKey(pageIndex, scale, totalRotation);
+    const exactCached = this._renderedBitmaps.get(exactKey);
+    if (exactCached && exactCached.width > 0 && exactCached.height > 0) {
+      if (canvas.width !== exactCached.width || canvas.height !== exactCached.height) {
+        canvas.width = exactCached.width;
+        canvas.height = exactCached.height;
+      }
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx?.drawImage(exactCached.canvas, 0, 0);
+      return;
+    }
 
     let page = this._pageCache.get(pageIndex);
     if (!page) {
@@ -484,19 +528,22 @@ export class PDFEngine {
     // page rotation, so only the USER rotation is passed here. Adding
     // page.rotate again double-rotated content out of its layout box and into
     // neighbouring pages on rotated documents.
-    const totalRotation = ((rotation || 0) % 360 + 360) % 360;
     const rawViewport = page.getViewport({ scale: scale * dpr, rotation: totalRotation });
 
-    // Cap backing-store size at extreme zoom/dpr to avoid multi-hundred-MB
-    // canvases; CSS style stays at layout size so output upscales cleanly.
+    // Cap backing-store size and total pixel budget at high zoom/dpr so
+    // integrated GPUs and WebKitGTK never allocate multi-hundred-MB canvases.
     let renderScale = scale * dpr;
     const rawW = Math.floor(rawViewport.width);
     const rawH = Math.floor(rawViewport.height);
     const largest = Math.max(rawW, rawH);
-    if (largest > MAX_RENDER_DIMENSION && largest > 0) {
-      renderScale *= MAX_RENDER_DIMENSION / largest;
+    if (largest > ADAPTIVE_CANVAS_MAX_DIMENSION && largest > 0) {
+      renderScale *= ADAPTIVE_CANVAS_MAX_DIMENSION / largest;
     }
-    const viewport = largest > MAX_RENDER_DIMENSION
+    const cappedArea = (rawW * (renderScale / (scale * dpr))) * (rawH * (renderScale / (scale * dpr)));
+    if (cappedArea > ADAPTIVE_CANVAS_MAX_PIXELS && cappedArea > 0) {
+      renderScale *= Math.sqrt(ADAPTIVE_CANVAS_MAX_PIXELS / cappedArea);
+    }
+    const viewport = renderScale !== scale * dpr
       ? page.getViewport({ scale: renderScale, rotation: totalRotation })
       : rawViewport;
 
@@ -507,7 +554,6 @@ export class PDFEngine {
     // immediately (even at a different zoom) so the user never sees white
     // canvas space while re-rendering. CSS size is owned by main.ts layout —
     // only the backing store is touched here to avoid ±1px seam drift.
-    const exactKey = bitmapKey(pageIndex, scale, totalRotation);
     const cached = this._renderedBitmaps.get(exactKey) ?? this.findAnyBitmap(pageIndex);
     if (cached) {
       if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
@@ -516,10 +562,8 @@ export class PDFEngine {
       }
       const ctx = canvas.getContext('2d', { alpha: false });
       if (ctx) {
-        // Scaled placeholder blit: bicubic-quality resampling minimizes both
-        // shimmer when upscaling and moiré when downscaling a cached frame.
         ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
+        ctx.imageSmoothingQuality = 'medium';
         ctx.drawImage(cached.canvas, 0, 0, targetWidth, targetHeight);
       }
 
@@ -536,7 +580,11 @@ export class PDFEngine {
     offscreen.width = targetWidth;
     offscreen.height = targetHeight;
     const offCtx = offscreen.getContext('2d', { alpha: false });
-    if (!offCtx) return;
+    if (!offCtx) {
+      offscreen.width = 1;
+      offscreen.height = 1;
+      return;
+    }
 
     offCtx.fillStyle = '#ffffff';
     offCtx.fillRect(0, 0, targetWidth, targetHeight);
@@ -553,6 +601,7 @@ export class PDFEngine {
 
     const task = page.render(renderContext);
     this._activeRenderTasks.set(pageIndex, task);
+    let storedInCache = false;
 
     try {
       await task.promise;
@@ -569,18 +618,36 @@ export class PDFEngine {
         return;
       }
 
-      // PIPE_3 VRAM POOL OOM GUARD: Cap active bitmap cache to 6 max.
-      if (this._renderedBitmaps.size >= 6) {
-        const oldestKey = this._renderedBitmaps.keys().next().value;
-        if (oldestKey !== undefined) {
-          const entry = this._renderedBitmaps.get(oldestKey);
-          if (entry?.canvas) {
+      // Evict any older zoom/rotation scale of this SAME pageIndex so multi-step
+      // zooming never accumulates multiple full-page bitmaps for the same page.
+      for (const [k, entry] of this._renderedBitmaps) {
+        if (entry.pageIndex === pageIndex && k !== exactKey) {
+          if (entry.canvas) {
             entry.canvas.width = 1;
             entry.canvas.height = 1;
           }
-          this._renderedBitmaps.delete(oldestKey);
+          this._renderedBitmaps.delete(k);
         }
       }
+
+      // PIPE_3 VRAM POOL OOM GUARD: Cap active bitmap cache to 3 pages max.
+      while (this._renderedBitmaps.size >= 3 && !this._renderedBitmaps.has(exactKey)) {
+        const oldestKey = this._renderedBitmaps.keys().next().value;
+        if (oldestKey === undefined) break;
+        const entry = this._renderedBitmaps.get(oldestKey);
+        if (entry?.canvas) {
+          entry.canvas.width = 1;
+          entry.canvas.height = 1;
+        }
+        this._renderedBitmaps.delete(oldestKey);
+      }
+
+      const prevExact = this._renderedBitmaps.get(exactKey);
+      if (prevExact?.canvas && prevExact.canvas !== offscreen) {
+        prevExact.canvas.width = 1;
+        prevExact.canvas.height = 1;
+      }
+
       this._renderedBitmaps.set(exactKey, {
         pageIndex,
         width: targetWidth,
@@ -589,6 +656,7 @@ export class PDFEngine {
         rotation: totalRotation,
         canvas: offscreen
       });
+      storedInCache = true;
 
       // Atomic blit to visible canvas with zero flicker and zero blank frame.
       // Backing store only — CSS size stays owned by the viewport layout.
@@ -603,8 +671,148 @@ export class PDFEngine {
         console.error(`Error rendering page ${pageIndex}:`, err);
       }
     } finally {
+      if (!storedInCache) {
+        offscreen.width = 1;
+        offscreen.height = 1;
+      }
       if (this._activeRenderTasks.get(pageIndex) === task) {
         this._activeRenderTasks.delete(pageIndex);
+      }
+    }
+  }
+
+  /**
+   * Returns true when the full-page base canvas is resolution-capped at the
+   * given zoom `scale`, meaning a High-DPI Viewport Chunk should be rendered
+   * over the visible portion of the page for crisp 100% native sharpness.
+   */
+  public needsViewportChunk(pageIndex: number, scale: number, rotation: number = 0): boolean {
+    const dpr = effectiveDpr();
+    const totalRotation = ((rotation || 0) % 360 + 360) % 360;
+    const page = this._pageCache.get(pageIndex);
+    let w: number;
+    let h: number;
+    if (page) {
+      const vp = page.getViewport({ scale: scale * dpr, rotation: totalRotation });
+      w = Math.floor(vp.width);
+      h = Math.floor(vp.height);
+    } else {
+      const info = store.activeDocument?.pages[pageIndex];
+      const baseW = info?.originalWidth || info?.width || 612;
+      const baseH = info?.originalHeight || info?.height || 792;
+      const swapped = totalRotation === 90 || totalRotation === 270;
+      w = Math.floor((swapped ? baseH : baseW) * scale * dpr);
+      h = Math.floor((swapped ? baseW : baseH) * scale * dpr);
+    }
+    return (
+      Math.max(w, h) > ADAPTIVE_CANVAS_MAX_DIMENSION * 1.05 ||
+      w * h > ADAPTIVE_CANVAS_MAX_PIXELS * 1.08
+    );
+  }
+
+  /**
+   * Renders ONLY the visible viewport intersection chunk `(rect.x, rect.y, rect.width, rect.height)`
+   * (in CSS pixels relative to the page container) at full native DPI using PDF.js's
+   * `offsetX`/`offsetY` viewport clipping. Keeps high-zoom (200%-800%) pages vector-sharp
+   * while using only ~2-3 megapixels of VRAM instead of 100+ MB.
+   */
+  public async renderPageChunkToCanvas(
+    pageIndex: number,
+    chunkCanvas: HTMLCanvasElement,
+    scale: number,
+    rotation: number,
+    rect: { x: number; y: number; width: number; height: number }
+  ): Promise<void> {
+    if (!this._pdfDoc || rect.width < 8 || rect.height < 8) return;
+    const renderDocId = this._currentDocId;
+    const totalRotation = ((rotation || 0) % 360 + 360) % 360;
+
+    let page = this._pageCache.get(pageIndex);
+    if (!page) {
+      try {
+        page = await this._pdfDoc.getPage(pageIndex + 1);
+      } catch (_) {
+        return;
+      }
+      if (renderDocId !== this._currentDocId || !chunkCanvas.isConnected) return;
+      this._pageCache.set(pageIndex, page);
+    }
+
+    const chunkDpr = resolveAdaptiveCanvasDpr(rect.width, rect.height, store.appSettings.targetDPI);
+    const chunkPixelX = Math.round(rect.x * chunkDpr);
+    const chunkPixelY = Math.round(rect.y * chunkDpr);
+    const chunkPixelW = Math.max(1, Math.round(rect.width * chunkDpr));
+    const chunkPixelH = Math.max(1, Math.round(rect.height * chunkDpr));
+
+    const chunkKey = `${scale.toFixed(4)}|${totalRotation}|${chunkPixelX},${chunkPixelY},${chunkPixelW},${chunkPixelH}`;
+    if (chunkCanvas.dataset.chunkKey === chunkKey && chunkCanvas.style.display !== 'none') {
+      return;
+    }
+
+    this.cancelPageChunkRender(pageIndex);
+
+    const chunkViewport = page.getViewport({
+      scale: scale * chunkDpr,
+      rotation: totalRotation,
+      offsetX: -chunkPixelX,
+      offsetY: -chunkPixelY
+    });
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = chunkPixelW;
+    offscreen.height = chunkPixelH;
+    const offCtx = offscreen.getContext('2d', { alpha: false });
+    if (!offCtx) {
+      offscreen.width = 1;
+      offscreen.height = 1;
+      return;
+    }
+
+    offCtx.fillStyle = '#ffffff';
+    offCtx.fillRect(0, 0, chunkPixelW, chunkPixelH);
+
+    const task = page.render({
+      canvas: offscreen,
+      canvasContext: offCtx,
+      viewport: chunkViewport,
+      intent: 'display',
+      annotationMode: pdfjsLib.AnnotationMode.ENABLE
+    });
+    this._activeChunkTasks.set(pageIndex, task);
+
+    try {
+      await task.promise;
+      if (!chunkCanvas.isConnected || renderDocId !== this._currentDocId) return;
+
+      chunkCanvas.style.left = `${rect.x}px`;
+      chunkCanvas.style.top = `${rect.y}px`;
+      chunkCanvas.style.width = `${rect.width}px`;
+      chunkCanvas.style.height = `${rect.height}px`;
+      if (chunkCanvas.width !== chunkPixelW || chunkCanvas.height !== chunkPixelH) {
+        chunkCanvas.width = chunkPixelW;
+        chunkCanvas.height = chunkPixelH;
+      }
+      chunkCanvas.dataset.chunkKey = chunkKey;
+      chunkCanvas.dataset.baseZoom = String(scale);
+      chunkCanvas.dataset.baseLeft = String(rect.x);
+      chunkCanvas.dataset.baseTop = String(rect.y);
+      chunkCanvas.dataset.baseWidth = String(rect.width);
+      chunkCanvas.dataset.baseHeight = String(rect.height);
+      chunkCanvas.style.display = 'block';
+
+      const ctx = chunkCanvas.getContext('2d', { alpha: false });
+      ctx?.drawImage(offscreen, 0, 0);
+    } catch (err: any) {
+      if (err?.name !== 'RenderingCancelledException') {
+        console.error(`Error rendering chunk for page ${pageIndex}:`, err);
+      }
+    } finally {
+      // Immediately collapse the temporary offscreen canvas to 1x1 so its
+      // 15–25MB GPU texture is freed deterministically without waiting for GC.
+      offscreen.width = 1;
+      offscreen.height = 1;
+      if (this._activeChunkTasks.get(pageIndex) === task) {
+        this._activeChunkTasks.delete(pageIndex);
       }
     }
   }
@@ -620,6 +828,14 @@ export class PDFEngine {
           task.cancel();
         } catch (_) {}
         this._activeRenderTasks.delete(pageIndex);
+      }
+    }
+    for (const [pageIndex, task] of this._activeChunkTasks) {
+      if (!visibleWindow.has(pageIndex)) {
+        try {
+          task.cancel();
+        } catch (_) {}
+        this._activeChunkTasks.delete(pageIndex);
       }
     }
   }
@@ -755,6 +971,12 @@ export class PDFEngine {
       const session = this._docSessions.get(docId)!;
       try {
         session.pageCache.clear();
+        for (const [, entry] of session.renderedBitmaps) {
+          if (entry.canvas) {
+            entry.canvas.width = 1;
+            entry.canvas.height = 1;
+          }
+        }
         session.renderedBitmaps.clear();
         if (typeof (session.doc as any).cleanup === 'function') {
           (session.doc as any).cleanup();
@@ -771,7 +993,7 @@ export class PDFEngine {
     if (this._currentDocId === docId) {
       this._pdfDoc = null;
       this._pageCache.clear();
-      this._renderedBitmaps.clear();
+      this.clearBitmapCache();
       this._currentDocId = null;
     }
   }

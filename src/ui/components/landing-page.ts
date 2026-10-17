@@ -46,26 +46,20 @@ export class LandingPageComponent {
       this._recentDocs = await getRecentDocuments();
     } catch (_) {}
 
-    // Calculate document counts per folder
-    const allCount = this._recentDocs.length;
-    const uncategorizedCount = this._recentDocs.filter(d => !d.folderId).length;
+    this.ensureShellMounted();
+    this.updateLibraryDOM();
+    this.updateFolderModalDOM();
+  }
 
-    // Filter documents by active folder
-    let filteredDocs = this._recentDocs;
-    if (this._activeFolderId === 'uncategorized') {
-      filteredDocs = this._recentDocs.filter(d => !d.folderId);
-    } else if (this._activeFolderId !== 'all') {
-      filteredDocs = this._recentDocs.filter(d => d.folderId === this._activeFolderId);
+  /**
+   * Mounts the static landing page shell (.landing-intro, .features-grid,
+   * .shortcuts-sheet) ONCE so entry animations never replay when folders or
+   * recent files are updated or deleted.
+   */
+  private ensureShellMounted(): void {
+    if (this._container.querySelector('.landing-container')) {
+      return;
     }
-
-    const activeFolder = this._folders.find(f => f.id === this._activeFolderId);
-
-    const folderColors = [
-      '#6366f1', '#10b981', '#f43f5e', '#f59e0b',
-      '#8b5cf6', '#06b6d4', '#2563eb', '#dc2626'
-    ];
-
-    const folderIcons = ['folder', 'book', 'briefcase', 'star', 'tag', 'code'];
 
     this._container.innerHTML = `
       <div class="landing-container">
@@ -130,152 +124,11 @@ export class LandingPageComponent {
             </div>
           </div>
 
-          <!-- Folder Filter Tabs Bar -->
-          <div class="folder-tabs-bar">
-            <button class="folder-tab-pill ${this._activeFolderId === 'all' ? 'active' : ''}" data-folder-pill="all">
-              <span>All Files</span>
-              <span class="folder-count">${allCount}</span>
-            </button>
-
-            <button class="folder-tab-pill ${this._activeFolderId === 'uncategorized' ? 'active' : ''}" data-folder-pill="uncategorized">
-              <span>Uncategorized</span>
-              <span class="folder-count">${uncategorizedCount}</span>
-            </button>
-
-            ${this._folders.map(folder => {
-              const count = this._recentDocs.filter(d => d.folderId === folder.id).length;
-              const isActive = this._activeFolderId === folder.id;
-              return `
-                <button class="folder-tab-pill ${isActive ? 'active' : ''}" data-folder-pill="${folder.id}" 
-                        style="${isActive ? `border-color:${folder.color}; box-shadow:0 0 12px ${folder.color}40;` : ''}">
-                  <span style="color:${folder.color};">${getIconSvg(folder.icon, 13)}</span>
-                  <span>${folder.name}</span>
-                  <span class="folder-count" style="${isActive ? `background:${folder.color};` : ''}">${count}</span>
-                </button>
-              `;
-            }).join('')}
-
-            <button class="folder-new-btn" id="open-new-folder-modal-btn" title="Create a new folder category">
-              ${getIconSvg('folderPlus', 14)}
-              <span>New Folder</span>
-            </button>
-          </div>
-
-          <!-- Active Folder Actions Bar -->
-          ${activeFolder ? `
-            <div class="folder-action-bar">
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span style="color:${activeFolder.color};">${getIconSvg(activeFolder.icon, 15)}</span>
-                <span>Category: <strong>${activeFolder.name}</strong> • ${filteredDocs.length} ${filteredDocs.length === 1 ? 'file' : 'files'}</span>
-              </div>
-              <button class="folder-danger-btn" id="delete-current-folder-btn" data-del-folder="${activeFolder.id}" title="Delete this folder">
-                ${getIconSvg('trash', 13)}
-                <span>Delete Folder</span>
-              </button>
-            </div>
-          ` : ''}
-
-          <!-- Documents Grid -->
-          <div class="recent-grid">
-            ${filteredDocs.length === 0 ? `
-              <div class="folder-empty-state">
-                No documents in this category. Open a PDF to add it here, or move an existing PDF using the category selector below.
-              </div>
-            ` : filteredDocs.map(doc => {
-              const docFolder = this._folders.find(f => f.id === doc.folderId);
-              return `
-                <div class="recent-card" data-recent-id="${doc.id}">
-                  <div class="recent-card-icon" style="${docFolder ? `background:${docFolder.color}22; color:${docFolder.color};` : ''}">
-                    ${getIconSvg(docFolder ? docFolder.icon : 'fileText', 20)}
-                  </div>
-                  <div class="recent-card-info">
-                    <div class="recent-card-name" title="${doc.name}">${doc.name}</div>
-                    <div class="recent-card-meta">
-                      <span>${doc.pageCount ? doc.pageCount + ' pages • ' : ''}${this.formatRelativeTime(doc.lastOpenedAt)}</span>
-                      ${docFolder ? `
-                        <span class="doc-folder-tag" style="background:${docFolder.color}20; color:${docFolder.color}; border:1px solid ${docFolder.color}40;">
-                          ${getIconSvg(docFolder.icon, 11)}
-                          <span>${docFolder.name}</span>
-                        </span>
-                      ` : ''}
-                    </div>
-                  </div>
-                  <div class="recent-card-actions">
-                    <select class="recent-folder-select" data-doc-assign="${doc.id}" title="Change Folder Category">
-                      <option value="">Move to...</option>
-                      <option value="none" ${!doc.folderId ? 'selected' : ''}>Uncategorized</option>
-                      ${this._folders.map(f => `
-                        <option value="${f.id}" ${doc.folderId === f.id ? 'selected' : ''}>${f.name}</option>
-                      `).join('')}
-                    </select>
-                    <button class="recent-remove-btn" data-remove-recent="${doc.id}" title="Remove from list">
-                      ${getIconSvg('close', 13)}
-                    </button>
-                  </div>
-                </div>
-              `;
-            }).join('')}
-          </div>
+          <div id="landing-library-body"></div>
         </div>
 
-        <!-- Create Folder Modal -->
-        ${this._showCreateFolderModal ? `
-          <div class="modal-overlay" id="new-folder-modal-overlay">
-            <div class="modal-dialog form-dialog" role="dialog" aria-modal="true" aria-label="Create category folder">
-              <div class="panel-header">
-                <span class="panel-header-title">
-                  ${getIconSvg('folderPlus', 16)}
-                  Create Category Folder
-                </span>
-                <button id="close-folder-modal-btn" class="icon-btn is-small" title="Close" aria-label="Close">
-                  ${getIconSvg('close', 14)}
-                </button>
-              </div>
-
-              <div class="form-dialog-body">
-                <div class="form-field">
-                  <label class="form-label" for="folder-name-input">Folder Name</label>
-                  <input type="text" id="folder-name-input" class="field"
-                         placeholder="e.g. Mathematics, Contracts, Research" autofocus />
-                </div>
-
-                <div class="form-field">
-                  <span class="form-label">Folder Color</span>
-                  <div class="chip-row">
-                    ${folderColors.map(color => `
-                      <button type="button"
-                              class="color-swatch is-square ${this._selectedFolderColor === color ? 'active' : ''}"
-                              data-pick-folder-color="${color}"
-                              style="background-color:${color};"
-                              title="${color}" aria-label="Colour ${color}"
-                              aria-pressed="${this._selectedFolderColor === color}"></button>
-                    `).join('')}
-                  </div>
-                </div>
-
-                <div class="form-field">
-                  <span class="form-label">Folder Icon</span>
-                  <div class="chip-row">
-                    ${folderIcons.map(icon => `
-                      <button type="button"
-                              class="secondary-btn is-compact is-capitalized ${this._selectedFolderIcon === icon ? 'is-selected' : ''}"
-                              data-pick-folder-icon="${icon}"
-                              aria-pressed="${this._selectedFolderIcon === icon}">
-                        ${getIconSvg(icon, 15)}
-                        ${icon}
-                      </button>
-                    `).join('')}
-                  </div>
-                </div>
-
-                <div class="form-actions">
-                  <button id="cancel-folder-btn" class="secondary-btn">Cancel</button>
-                  <button id="submit-folder-btn" class="primary-btn">Create Folder</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        ` : ''}
+        <!-- Create Folder Modal Slot -->
+        <div id="landing-folder-modal-slot"></div>
 
         <!-- Feature Showcase -->
         <div class="features-grid">
@@ -350,7 +203,195 @@ export class LandingPageComponent {
       </div>
     `;
 
-    this.bindEvents();
+    this.bindShellEvents();
+  }
+
+  /**
+   * Updates ONLY the folder filter tabs and recent documents grid in place
+   * without touching the page shell or replaying entry animations.
+   */
+  private updateLibraryDOM(): void {
+    const libraryBody = this._container.querySelector<HTMLElement>('#landing-library-body');
+    if (!libraryBody) return;
+
+    const allCount = this._recentDocs.length;
+    const uncategorizedCount = this._recentDocs.filter(d => !d.folderId).length;
+
+    let filteredDocs = this._recentDocs;
+    if (this._activeFolderId === 'uncategorized') {
+      filteredDocs = this._recentDocs.filter(d => !d.folderId);
+    } else if (this._activeFolderId !== 'all') {
+      filteredDocs = this._recentDocs.filter(d => d.folderId === this._activeFolderId);
+    }
+
+    const activeFolder = this._folders.find(f => f.id === this._activeFolderId);
+
+    libraryBody.innerHTML = `
+      <!-- Folder Filter Tabs Bar -->
+      <div class="folder-tabs-bar">
+        <button class="folder-tab-pill ${this._activeFolderId === 'all' ? 'active' : ''}" data-folder-pill="all">
+          <span>All Files</span>
+          <span class="folder-count">${allCount}</span>
+        </button>
+
+        <button class="folder-tab-pill ${this._activeFolderId === 'uncategorized' ? 'active' : ''}" data-folder-pill="uncategorized">
+          <span>Uncategorized</span>
+          <span class="folder-count">${uncategorizedCount}</span>
+        </button>
+
+        ${this._folders.map(folder => {
+          const count = this._recentDocs.filter(d => d.folderId === folder.id).length;
+          const isActive = this._activeFolderId === folder.id;
+          return `
+            <button class="folder-tab-pill ${isActive ? 'active' : ''}" data-folder-pill="${folder.id}" 
+                    style="${isActive ? `border-color:${folder.color}; box-shadow:0 0 12px ${folder.color}40;` : ''}">
+              <span style="color:${folder.color};">${getIconSvg(folder.icon, 13)}</span>
+              <span>${folder.name}</span>
+              <span class="folder-count" style="${isActive ? `background:${folder.color};` : ''}">${count}</span>
+            </button>
+          `;
+        }).join('')}
+
+        <button class="folder-new-btn" id="open-new-folder-modal-btn" title="Create a new folder category">
+          ${getIconSvg('folderPlus', 14)}
+          <span>New Folder</span>
+        </button>
+      </div>
+
+      <!-- Active Folder Actions Bar -->
+      ${activeFolder ? `
+        <div class="folder-action-bar">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="color:${activeFolder.color};">${getIconSvg(activeFolder.icon, 15)}</span>
+            <span>Category: <strong>${activeFolder.name}</strong> • ${filteredDocs.length} ${filteredDocs.length === 1 ? 'file' : 'files'}</span>
+          </div>
+          <button class="folder-danger-btn" id="delete-current-folder-btn" data-del-folder="${activeFolder.id}" title="Delete this folder">
+            ${getIconSvg('trash', 13)}
+            <span>Delete Folder</span>
+          </button>
+        </div>
+      ` : ''}
+
+      <!-- Documents Grid -->
+      <div class="recent-grid">
+        ${filteredDocs.length === 0 ? `
+          <div class="folder-empty-state">
+            No documents in this category. Open a PDF to add it here, or move an existing PDF using the category selector below.
+          </div>
+        ` : filteredDocs.map(doc => {
+          const docFolder = this._folders.find(f => f.id === doc.folderId);
+          return `
+            <div class="recent-card" data-recent-id="${doc.id}">
+              <div class="recent-card-icon" style="${docFolder ? `background:${docFolder.color}22; color:${docFolder.color};` : ''}">
+                ${getIconSvg(docFolder ? docFolder.icon : 'fileText', 20)}
+              </div>
+              <div class="recent-card-info">
+                <div class="recent-card-name" title="${doc.name}">${doc.name}</div>
+                <div class="recent-card-meta">
+                  <span>${doc.pageCount ? doc.pageCount + ' pages • ' : ''}${this.formatRelativeTime(doc.lastOpenedAt)}</span>
+                  ${docFolder ? `
+                    <span class="doc-folder-tag" style="background:${docFolder.color}20; color:${docFolder.color}; border:1px solid ${docFolder.color}40;">
+                      ${getIconSvg(docFolder.icon, 11)}
+                      <span>${docFolder.name}</span>
+                    </span>
+                  ` : ''}
+                </div>
+              </div>
+              <div class="recent-card-actions">
+                <select class="recent-folder-select" data-doc-assign="${doc.id}" title="Change Folder Category">
+                  <option value="">Move to...</option>
+                  <option value="none" ${!doc.folderId ? 'selected' : ''}>Uncategorized</option>
+                  ${this._folders.map(f => `
+                    <option value="${f.id}" ${doc.folderId === f.id ? 'selected' : ''}>${f.name}</option>
+                  `).join('')}
+                </select>
+                <button class="recent-remove-btn" data-remove-recent="${doc.id}" title="Remove from list">
+                  ${getIconSvg('close', 13)}
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+
+    this.bindLibraryEvents(libraryBody);
+  }
+
+  private updateFolderModalDOM(): void {
+    const slot = this._container.querySelector<HTMLElement>('#landing-folder-modal-slot');
+    if (!slot) return;
+
+    if (!this._showCreateFolderModal) {
+      slot.innerHTML = '';
+      return;
+    }
+
+    const folderColors = [
+      '#6366f1', '#10b981', '#f43f5e', '#f59e0b',
+      '#8b5cf6', '#06b6d4', '#2563eb', '#dc2626'
+    ];
+    const folderIcons = ['folder', 'book', 'briefcase', 'star', 'tag', 'code'];
+
+    slot.innerHTML = `
+      <div class="modal-overlay" id="new-folder-modal-overlay">
+        <div class="modal-dialog form-dialog" role="dialog" aria-modal="true" aria-label="Create category folder">
+          <div class="panel-header">
+            <span class="panel-header-title">
+              ${getIconSvg('folderPlus', 16)}
+              Create Category Folder
+            </span>
+            <button id="close-folder-modal-btn" class="icon-btn is-small" title="Close" aria-label="Close">
+              ${getIconSvg('close', 14)}
+            </button>
+          </div>
+
+          <div class="form-dialog-body">
+            <div class="form-field">
+              <label class="form-label" for="folder-name-input">Folder Name</label>
+              <input type="text" id="folder-name-input" class="field"
+                     placeholder="e.g. Mathematics, Contracts, Research" autofocus />
+            </div>
+
+            <div class="form-field">
+              <span class="form-label">Folder Color</span>
+              <div class="chip-row">
+                ${folderColors.map(color => `
+                  <button type="button"
+                          class="color-swatch is-square ${this._selectedFolderColor === color ? 'active' : ''}"
+                          data-pick-folder-color="${color}"
+                          style="background-color:${color};"
+                          title="${color}" aria-label="Colour ${color}"
+                          aria-pressed="${this._selectedFolderColor === color}"></button>
+                `).join('')}
+              </div>
+            </div>
+
+            <div class="form-field">
+              <span class="form-label">Folder Icon</span>
+              <div class="chip-row">
+                ${folderIcons.map(icon => `
+                  <button type="button"
+                          class="secondary-btn is-compact is-capitalized ${this._selectedFolderIcon === icon ? 'is-selected' : ''}"
+                          data-pick-folder-icon="${icon}"
+                          aria-pressed="${this._selectedFolderIcon === icon}">
+                    ${getIconSvg(icon, 15)}
+                    ${icon}
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+
+            <div class="form-actions">
+              <button id="cancel-folder-btn" class="secondary-btn">Cancel</button>
+              <button id="submit-folder-btn" class="primary-btn">Create Folder</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    this.bindFolderModalEvents(slot);
   }
 
   /**
@@ -378,13 +419,12 @@ export class LandingPageComponent {
     dialog.render();
   }
 
-  private bindEvents(): void {
+  private bindShellEvents(): void {
     const dropzone = this._container.querySelector('#landing-dropzone');
     const openBtn = this._container.querySelector('#landing-open-btn');
     const sampleBtn = this._container.querySelector('#landing-sample-btn');
     const notebookBtn = this._container.querySelector('#landing-notebook-btn');
 
-    // Click dropzone or open button
     openBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
       this._callbacks.onOpenFile();
@@ -395,7 +435,6 @@ export class LandingPageComponent {
       this._callbacks.onOpenFile();
     });
 
-    // Sample PDF loader
     sampleBtn?.addEventListener('click', async (e) => {
       e.stopPropagation();
       try {
@@ -406,13 +445,11 @@ export class LandingPageComponent {
       }
     });
 
-    // New notebook: choose the paper first, then generate it
     notebookBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
       this.openNotebookDialog();
     });
 
-    // Dropzone drag & drop
     dropzone?.addEventListener('dragover', (e: Event) => {
       const dragEvt = e as DragEvent;
       dragEvt.preventDefault();
@@ -433,63 +470,121 @@ export class LandingPageComponent {
         await this._callbacks.onOpenBytes(file.name, bytes);
       }
     });
+  }
 
-    // Folder Pill switching
-    this._container.querySelectorAll('[data-folder-pill]').forEach(pill => {
+  private bindLibraryEvents(libraryBody: HTMLElement): void {
+    // Folder Pill switching (instant synchronous DOM update)
+    libraryBody.querySelectorAll('[data-folder-pill]').forEach(pill => {
       pill.addEventListener('click', () => {
         const folderId = pill.getAttribute('data-folder-pill');
-        if (folderId) {
+        if (folderId && folderId !== this._activeFolderId) {
           this._activeFolderId = folderId;
-          this.render();
+          this.updateLibraryDOM();
         }
       });
     });
 
     // Open New Folder Modal
-    this._container.querySelector('#open-new-folder-modal-btn')?.addEventListener('click', () => {
+    libraryBody.querySelector('#open-new-folder-modal-btn')?.addEventListener('click', () => {
       this._showCreateFolderModal = true;
-      this.render();
+      this.updateFolderModalDOM();
     });
 
-    // Close Folder Modal
-    this._container.querySelector('#close-folder-modal-btn')?.addEventListener('click', () => {
-      this._showCreateFolderModal = false;
-      this.render();
-    });
-    this._container.querySelector('#cancel-folder-btn')?.addEventListener('click', () => {
-      this._showCreateFolderModal = false;
-      this.render();
+    // Delete Current Folder
+    libraryBody.querySelector('#delete-current-folder-btn')?.addEventListener('click', async () => {
+      if (this._activeFolderId !== 'all' && this._activeFolderId !== 'uncategorized') {
+        if (confirm('Delete this folder category? The documents will be kept in Uncategorized.')) {
+          const delId = this._activeFolderId;
+          this._folders = this._folders.filter(f => f.id !== delId);
+          this._recentDocs = this._recentDocs.map(d => d.folderId === delId ? { ...d, folderId: undefined } : d);
+          this._activeFolderId = 'all';
+          this.updateLibraryDOM();
+          await deleteFolder(delId);
+        }
+      }
     });
 
-    // Pick Folder Color
-    this._container.querySelectorAll('[data-pick-folder-color]').forEach(swatch => {
+    // Assign Document to Folder (optimistic instant update)
+    libraryBody.querySelectorAll<HTMLSelectElement>('[data-doc-assign]').forEach(sel => {
+      sel.addEventListener('click', (e) => e.stopPropagation());
+      sel.addEventListener('change', (e) => {
+        e.stopPropagation();
+        const docId = sel.getAttribute('data-doc-assign');
+        const val = sel.value;
+        if (docId) {
+          const targetFolderId = val === 'none' || !val ? null : val;
+          this._recentDocs = this._recentDocs.map(d =>
+            d.id === docId ? { ...d, folderId: targetFolderId || undefined } : d
+          );
+          this.updateLibraryDOM();
+          void assignDocToFolder(docId, targetFolderId);
+        }
+      });
+    });
+
+    // Remove Document from Recents (optimistic instant removal with zero flash)
+    libraryBody.querySelectorAll('[data-remove-recent]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const docId = btn.getAttribute('data-remove-recent');
+        if (docId) {
+          this._recentDocs = this._recentDocs.filter(d => d.id !== docId);
+          this.updateLibraryDOM();
+          void deleteRecentDocument(docId);
+        }
+      });
+    });
+
+    // Recent card click to open PDF
+    libraryBody.querySelectorAll('[data-recent-id]').forEach(el => {
+      el.addEventListener('click', async (e) => {
+        if ((e.target as HTMLElement).closest('.recent-card-actions')) return;
+        const id = el.getAttribute('data-recent-id');
+        if (id) {
+          await this._callbacks.onOpenRecent(id);
+        }
+      });
+    });
+  }
+
+  private bindFolderModalEvents(slot: HTMLElement): void {
+    const closeModal = () => {
+      this._showCreateFolderModal = false;
+      this.updateFolderModalDOM();
+    };
+
+    slot.querySelector('#close-folder-modal-btn')?.addEventListener('click', closeModal);
+    slot.querySelector('#cancel-folder-btn')?.addEventListener('click', closeModal);
+    slot.querySelector('#new-folder-modal-overlay')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) closeModal();
+    });
+
+    slot.querySelectorAll('[data-pick-folder-color]').forEach(swatch => {
       swatch.addEventListener('click', () => {
         const color = swatch.getAttribute('data-pick-folder-color');
         if (color) {
           this._selectedFolderColor = color;
-          this._container.querySelectorAll('[data-pick-folder-color]').forEach(s => {
+          slot.querySelectorAll('[data-pick-folder-color]').forEach(s => {
             s.classList.toggle('active', s.getAttribute('data-pick-folder-color') === color);
           });
         }
       });
     });
 
-    // Pick Folder Icon
-    this._container.querySelectorAll('[data-pick-folder-icon]').forEach(btn => {
+    slot.querySelectorAll('[data-pick-folder-icon]').forEach(btn => {
       btn.addEventListener('click', () => {
         const icon = btn.getAttribute('data-pick-folder-icon');
         if (icon) {
           this._selectedFolderIcon = icon;
-          this._container.querySelectorAll('[data-pick-folder-icon]').forEach(b => {
-            b.classList.toggle('active', b.getAttribute('data-pick-folder-icon') === icon);
+          slot.querySelectorAll('[data-pick-folder-icon]').forEach(b => {
+            b.classList.toggle('is-selected', b.getAttribute('data-pick-folder-icon') === icon);
           });
         }
       });
     });
 
-    // Submit Folder Creation
-    this._container.querySelector('#submit-folder-btn')?.addEventListener('click', async () => {
-      const input = this._container.querySelector<HTMLInputElement>('#folder-name-input');
+    slot.querySelector('#submit-folder-btn')?.addEventListener('click', async () => {
+      const input = slot.querySelector<HTMLInputElement>('#folder-name-input');
       const name = input?.value.trim();
       if (!name) {
         input?.focus();
@@ -504,59 +599,12 @@ export class LandingPageComponent {
         createdAt: Date.now()
       };
 
-      await saveFolder(newFolder);
+      this._folders.push(newFolder);
       this._showCreateFolderModal = false;
       this._activeFolderId = newFolder.id;
-      await this.render();
-    });
-
-    // Delete Current Folder
-    this._container.querySelector('#delete-current-folder-btn')?.addEventListener('click', async () => {
-      if (this._activeFolderId !== 'all' && this._activeFolderId !== 'uncategorized') {
-        if (confirm('Delete this folder category? The documents will be kept in Uncategorized.')) {
-          await deleteFolder(this._activeFolderId);
-          this._activeFolderId = 'all';
-          await this.render();
-        }
-      }
-    });
-
-    // Assign Document to Folder
-    this._container.querySelectorAll<HTMLSelectElement>('[data-doc-assign]').forEach(sel => {
-      sel.addEventListener('click', (e) => e.stopPropagation());
-      sel.addEventListener('change', async (e) => {
-        e.stopPropagation();
-        const docId = sel.getAttribute('data-doc-assign');
-        const val = sel.value;
-        if (docId) {
-          await assignDocToFolder(docId, val === 'none' || !val ? null : val);
-          await this.render();
-        }
-      });
-    });
-
-    // Remove Document from Recents
-    this._container.querySelectorAll('[data-remove-recent]').forEach(btn => {
-      btn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const docId = btn.getAttribute('data-remove-recent');
-        if (docId) {
-          await deleteRecentDocument(docId);
-          await this.render();
-        }
-      });
-    });
-
-    // Recent card click to open PDF
-    this._container.querySelectorAll('[data-recent-id]').forEach(el => {
-      el.addEventListener('click', async (e) => {
-        // If clicked actions dropdown or remove button, do not open
-        if ((e.target as HTMLElement).closest('.recent-card-actions')) return;
-        const id = el.getAttribute('data-recent-id');
-        if (id) {
-          await this._callbacks.onOpenRecent(id);
-        }
-      });
+      this.updateFolderModalDOM();
+      this.updateLibraryDOM();
+      await saveFolder(newFolder);
     });
   }
 

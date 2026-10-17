@@ -151,8 +151,25 @@ export class SettingsModalComponent {
     }
 
     this._lastRenderKey = renderKey;
+    const langChanged = this._renderedLanguage !== app.language;
     this._renderedLanguage = app.language;
     const prevScroll = this._container.querySelector('.settings-content')?.scrollTop ?? 0;
+
+    const existingOverlay = this._container.querySelector('#settings-overlay');
+    const existingContent = this._container.querySelector<HTMLElement>('.settings-content');
+
+    // If the modal dialog is already mounted and language hasn't changed,
+    // patch only the tab buttons and right content area in place so the modal
+    // overlay and dialog never flash or replay their scale/fade entrance animation.
+    if (existingOverlay && existingContent && !langChanged) {
+      this._container.querySelectorAll<HTMLElement>('.settings-tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-tab') === this._activeTab);
+      });
+      existingContent.innerHTML = this.renderTabContent(app, tools);
+      this.bindContentEvents();
+      if (prevScroll > 0) existingContent.scrollTop = prevScroll;
+      return;
+    }
 
     this._container.innerHTML = `
       <div class="modal-overlay" id="settings-overlay">

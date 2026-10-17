@@ -10,6 +10,7 @@ import { normalizeHighlighterColor } from '../../annotations/spline';
 import { getIconSvg } from '../../utils/icons';
 import { t } from '../i18n';
 import { Annotation } from '../../core/types';
+import { textTool } from '../../annotations/tools/text';
 
 /** Validates free-typed hex colors (`#rrggbb`, `#rgb`, with/without `#`). */
 function parseHexInput(raw: string): string | null {
@@ -136,13 +137,13 @@ export class PropertiesPanelComponent {
           </div>
         ` : ''}
 
-        <!-- Stroke Width -->
+        <!-- Stroke Width / Font Size -->
         <div class="prop-group">
           <div class="prop-label-row">
-            <span class="prop-label">${t('properties.strokeWidth')}</span>
+            <span class="prop-label">${'fontSize' in firstAnn ? 'Font Size' : t('properties.strokeWidth')}</span>
             <input type="number" class="prop-value prop-num-input" id="prop-width-val"
-                   min="0.5" max="100" step="0.5" value="${(firstAnn as any).strokeWidth || 3}"
-                   title="Type any width (0.5-100px)" aria-label="${t('properties.strokeWidth')}">
+                   min="0.5" max="120" step="0.5" value="${(firstAnn as any).strokeWidth || (firstAnn as any).fontSize || 3}"
+                   title="Type any size" aria-label="${t('properties.strokeWidth')}">
           </div>
         </div>
 
@@ -282,6 +283,29 @@ export class PropertiesPanelComponent {
           const prev = { ...ann };
           const next = { ...ann, strokeWidth: val };
           history.execute(new ModifyAnnotationCommand(ann.pageIndex, prev, next));
+        } else if ('fontSize' in ann) {
+          const a = ann as any;
+          const nf = Math.max(8, Math.min(120, val));
+          const measured = textTool.measureTextBox(
+            a.text || '',
+            nf,
+            a.fontFamily || 'Inter',
+            a.padding ?? 8,
+            a.fontWeight,
+            a.fontStyle
+          );
+          const prev = { ...ann };
+          const next = {
+            ...ann,
+            fontSize: nf,
+            box: {
+              x: a.box.x,
+              y: a.box.y,
+              width: measured.width,
+              height: measured.height
+            }
+          };
+          history.execute(new ModifyAnnotationCommand(ann.pageIndex, prev, next));
         }
       });
       store.setActivePageIndex(store.activePageIndex);
@@ -303,16 +327,16 @@ export class PropertiesPanelComponent {
     const widthNum = this._container.querySelector<HTMLInputElement>('#prop-width-val');
     const commitWidthNum = () => {
       if (!widthNum) return;
-      const fallback = Number((firstAnn as any).strokeWidth) || 3;
+      const fallback = Number((firstAnn as any).strokeWidth || (firstAnn as any).fontSize) || 3;
       const n = parseFloat(widthNum.value);
-      const val = Number.isFinite(n) ? Math.min(100, Math.max(0.5, n)) : fallback;
+      const val = Number.isFinite(n) ? Math.min(120, Math.max(0.5, n)) : fallback;
       widthNum.value = String(val);
       applyStrokeWidth(val);
     };
     widthNum?.addEventListener('keydown', (e) => {
       e.stopPropagation();
       if (e.key === 'Enter') { e.preventDefault(); commitWidthNum(); widthNum.blur(); }
-      else if (e.key === 'Escape') { e.preventDefault(); widthNum.value = String((firstAnn as any).strokeWidth || 3); widthNum.blur(); }
+      else if (e.key === 'Escape') { e.preventDefault(); widthNum.value = String((firstAnn as any).strokeWidth || (firstAnn as any).fontSize || 3); widthNum.blur(); }
     });
     widthNum?.addEventListener('focus', () => widthNum.select());
     widthNum?.addEventListener('change', () => commitWidthNum());

@@ -20,6 +20,10 @@ export default defineConfig(({ mode }) => {
 
   return {
     base: './',
+    server: {
+      port: 3000,
+      host: '0.0.0.0'
+    },
     define: {
       __APP_VERSION__: JSON.stringify(pkg.version)
     },
@@ -50,6 +54,28 @@ export default defineConfig(({ mode }) => {
     plugins: [
       {
         name: 'copy-extension-manifest-and-assets',
+        buildStart() {
+          // Keep public/pdf.worker.min.mjs synchronized with installed pdfjs-dist version
+          const distWorker = resolve(import.meta.dirname, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs');
+          const publicWorker = resolve(import.meta.dirname, 'public/pdf.worker.min.mjs');
+          if (fs.existsSync(distWorker)) {
+            fs.copyFileSync(distWorker, publicWorker);
+          }
+        },
+        configureServer(server) {
+          server.middlewares.use((req, res, next) => {
+            const url = req.url?.split('?')[0] || '';
+            if (url.startsWith('/cmaps/') || url.startsWith('/standard_fonts/')) {
+              const rel = url.slice(1);
+              const filePath = resolve(import.meta.dirname, 'node_modules/pdfjs-dist', rel);
+              if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+                res.end(fs.readFileSync(filePath));
+                return;
+              }
+            }
+            next();
+          });
+        },
         closeBundle() {
           // Copy appropriate manifest if building an extension
           if (!isDesktop) {
@@ -72,9 +98,11 @@ export default defineConfig(({ mode }) => {
           }
 
           // Copy PDF.js worker
-          const workerSrc = resolve(import.meta.dirname, 'public/pdf.worker.min.mjs');
-          if (fs.existsSync(workerSrc)) {
-            fs.copyFileSync(workerSrc, `${outDir}/pdf.worker.min.mjs`);
+          const workerSrc = resolve(import.meta.dirname, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs');
+          const fallbackWorkerSrc = resolve(import.meta.dirname, 'public/pdf.worker.min.mjs');
+          const actualWorkerSrc = fs.existsSync(workerSrc) ? workerSrc : fallbackWorkerSrc;
+          if (fs.existsSync(actualWorkerSrc)) {
+            fs.copyFileSync(actualWorkerSrc, `${outDir}/pdf.worker.min.mjs`);
             console.log(`Copied PDF.js worker to ${outDir}/pdf.worker.min.mjs`);
           }
 

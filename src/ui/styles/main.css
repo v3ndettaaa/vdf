@@ -941,6 +941,7 @@ body.no-page-shadows .pdf-page-container {
   height: 100%;
   overflow: auto;
   position: relative;
+  direction: ltr;
   scrollbar-gutter: stable both-edges;
   /* Firefox: full-size scrollbar with a quiet track. */
   scrollbar-width: auto;
@@ -992,6 +993,7 @@ body.no-page-shadows .pdf-page-container {
   box-shadow: var(--canvas-page-shadow);
   border-radius: 4px;
   overflow: hidden;
+  contain: layout style paint;
 }
 
 .pdf-page-canvas {
@@ -1003,16 +1005,13 @@ body.no-page-shadows .pdf-page-container {
   transition: filter 0.2s ease;
 }
 
-body.invert-pdf-document .pdf-page-canvas {
-  filter: invert(0.92) hue-rotate(180deg) brightness(0.95) contrast(1.05);
+.pdf-chunk-canvas {
+  z-index: 2;
+  display: none;
 }
 
-.pattern-canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-  pointer-events: none;
-  z-index: 2;
+body.invert-pdf-document .pdf-page-canvas {
+  filter: invert(0.92) hue-rotate(180deg) brightness(0.95) contrast(1.05);
 }
 
 .annotation-canvas {
@@ -1023,6 +1022,15 @@ body.invert-pdf-document .pdf-page-canvas {
   z-index: 3;
 }
 
+.annot-chunk-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 4;
+  display: none;
+}
+
 /* The cursor itself is set inline from src/ui/cursor.ts, which draws the
    size-indicating cursors at the brush's real on-screen size. `crosshair` here
    is the pre-paint default and the fallback for oversized brushes. */
@@ -1030,9 +1038,18 @@ body.invert-pdf-document .pdf-page-canvas {
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 4;
+  z-index: 5;
   touch-action: none;
   cursor: crosshair;
+}
+
+.scratch-chunk-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 6;
+  display: none;
 }
 
 /* Floating View Controls */

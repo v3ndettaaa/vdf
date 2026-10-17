@@ -25,7 +25,7 @@ import { openDocumentSession, getDocumentSession, createDocumentId, saveDocument
 import { saveActiveDocument, saveActiveDocumentAs, forgetFileHandle, rememberFileHandle, isDocumentDirty } from './io/save';
 import { selectionManager, transformAnnotation } from './annotations/selection';
 import { mergeBoundingBoxes } from './utils/geometry';
-import { resolveAnnotationDpr, clampRenderMultiplier } from './utils/dpi';
+import { resolveAdaptiveCanvasDpr } from './utils/dpi';
 import { t } from './ui/i18n';
 import { LandingPageComponent } from './ui/components/landing-page';
 import { initAppearanceSync } from './ui/theme';
@@ -63,9 +63,11 @@ class VeditorApp {
   private _renderedPages: Map<number, {
     container: HTMLElement;
     pdfCanvas: HTMLCanvasElement;
-    patternCanvas: HTMLCanvasElement;
+    chunkCanvas?: HTMLCanvasElement;
     annotCanvas: HTMLCanvasElement;
+    annotChunkCanvas?: HTMLCanvasElement;
     scratchCanvas: HTMLCanvasElement;
+    scratchChunkCanvas?: HTMLCanvasElement;
     /**
      * Signature of the layout that produced this element's current size
      * (zoom | render dpr | page rotation). A change means every backing store
@@ -94,9 +96,11 @@ class VeditorApp {
   private _docSwitchSeq: number = 0;
 
   private _zoomCommitTimer: number | null = null;
+  private _chunkUpdateTimer: number | null = null;
   private _previewRafId: number | null = null;
   private _previewPendingFactor: number = 1;
   private _previewPendingCenter: { x: number; y: number } | null = null;
+  private _isZoomGestureActive: boolean = false;
 
   /**
    * Hand-tool pan drag: pointer id + grab point + scroll origin. While set,
@@ -611,7 +615,20 @@ class VeditorApp {
   }
 
   private clearRenderedPages() {
-    for (const [, p] of this._renderedPages) {
+    for (const [pageIndex, p] of this._renderedPages) {
+      pdfEngine.cancelPageRender(pageIndex);
+      p.pdfCanvas.width = 1; p.pdfCanvas.height = 1;
+      if (p.chunkCanvas) {
+        p.chunkCanvas.width = 1; p.chunkCanvas.height = 1;
+      }
+      p.annotCanvas.width = 1; p.annotCanvas.height = 1;
+      if (p.annotChunkCanvas) {
+        p.annotChunkCanvas.width = 1; p.annotChunkCanvas.height = 1;
+      }
+      p.scratchCanvas.width = 1; p.scratchCanvas.height = 1;
+      if (p.scratchChunkCanvas) {
+        p.scratchChunkCanvas.width = 1; p.scratchChunkCanvas.height = 1;
+      }
       if (p.container.parentNode === this._pagesWrapper) {
         this._pagesWrapper.removeChild(p.container);
       }
@@ -828,6 +845,13 @@ class VeditorApp {
     this.scheduleZoomCommit();
   }
 
+  /**
+   * Phase 1 of Two-Phase Live Zoom: updates page container CSS sizes and
+   * focal-anchored scroll offsets once per animation frame while keeping
+   * existing canvas bitmaps stretched via CSS (`_isZoomGestureActive = true`).
+   * Zero canvas buffer reallocations, zero blanking of annotations/PDF, and
+   * zero oversized wrapper texture layers.
+   */
   private flushPreviewZoom(): void {
     this._previewRafId = null;
     const factor = this._previewPendingFactor;
@@ -835,15 +859,19 @@ class VeditorApp {
     this._previewPendingFactor = 1;
     this._previewPendingCenter = null;
     if (!store.activeDocument || !center || pointerHandler.isPointerDown || this._handPan) return;
+
+    this._isZoomGestureActive = true;
     const rect = this._scrollContainer.getBoundingClientRect();
-    viewportManager.zoomByFactor(factor, { x: center.x - rect.left, y: center.y - rect.top });
+    const cx = center.x - rect.left;
+    const cy = center.y - rect.top;
+    viewportManager.zoomByFactor(factor, { x: cx, y: cy });
   }
 
   private scheduleZoomCommit(): void {
     if (this._zoomCommitTimer !== null) window.clearTimeout(this._zoomCommitTimer);
-    // Commit shortly after the last tick/finger move: one layout + one render
-    // pass for the entire gesture instead of dozens per second mid-gesture.
-    this._zoomCommitTimer = window.setTimeout(() => this.commitZoomPreview(), 160);
+    // Commit shortly after the last tick/finger move: resizes backing stores
+    // once and renders crisp PDF + High-DPI Viewport Chunk.
+    this._zoomCommitTimer = window.setTimeout(() => this.commitZoomPreview(), 150);
   }
 
   /** Drops any in-flight pinch/trackpad preview so a tab switch starts 1:1. */
@@ -852,12 +880,17 @@ class VeditorApp {
       window.clearTimeout(this._zoomCommitTimer);
       this._zoomCommitTimer = null;
     }
+    if (this._chunkUpdateTimer !== null) {
+      window.clearTimeout(this._chunkUpdateTimer);
+      this._chunkUpdateTimer = null;
+    }
     if (this._previewRafId !== null) {
       window.cancelAnimationFrame(this._previewRafId);
       this._previewRafId = null;
     }
     this._previewPendingFactor = 1;
     this._previewPendingCenter = null;
+    this._isZoomGestureActive = false;
     if (this._pagesWrapper) {
       this._pagesWrapper.style.transform = '';
       this._pagesWrapper.style.transformOrigin = '';
@@ -865,14 +898,352 @@ class VeditorApp {
     viewportManager.setPreviewScale(1);
   }
 
+  /**
+   * Phase 2 of Two-Phase Live Zoom: exits gesture-stretch mode and executes a
+   * single crisp backing-store resize + synchronous annotation repaint +
+   * double-buffered PDF & High-DPI Viewport Chunk render.
+   */
   private commitZoomPreview(): void {
-    if (this._zoomCommitTimer !== null) window.clearTimeout(this._zoomCommitTimer);
-    this._zoomCommitTimer = null;
+    if (this._zoomCommitTimer !== null) {
+      window.clearTimeout(this._zoomCommitTimer);
+      this._zoomCommitTimer = null;
+    }
     if (this._previewRafId !== null) {
       window.cancelAnimationFrame(this._previewRafId);
       this._previewRafId = null;
       this.flushPreviewZoom();
     }
+    if (!this._isZoomGestureActive) {
+      return;
+    }
+    this._isZoomGestureActive = false;
+    viewportManager.handleScroll(true);
+  }
+
+  private scheduleChunkUpdate(delayMs: number = 75): void {
+    if (this._chunkUpdateTimer !== null) {
+      window.clearTimeout(this._chunkUpdateTimer);
+    }
+    this._chunkUpdateTimer = window.setTimeout(() => {
+      this._chunkUpdateTimer = null;
+      this.updateVisiblePageChunks(true);
+    }, delayMs);
+  }
+
+  /**
+   * Computes the exact intersection of a mounted page container with the scroll
+   * container's visible viewport (padded by 128 CSS px) using live screen
+   * bounding rects. Immune to RTL scrollLeft sign inversions and margin offsets.
+   */
+  private computePageViewportChunkRect(
+    container: HTMLElement,
+    layout: { top: number; left: number; width: number; height: number }
+  ): { x: number; y: number; width: number; height: number } | null {
+    if (!this._scrollContainer) return null;
+    const pad = 128;
+    const scrollRect = this._scrollContainer.getBoundingClientRect();
+    const pageRect = container.getBoundingClientRect();
+
+    let ix0: number;
+    let iy0: number;
+    let ix1: number;
+    let iy1: number;
+
+    if (scrollRect.width > 0 && scrollRect.height > 0 && pageRect.width > 0 && pageRect.height > 0) {
+      ix0 = Math.max(0, Math.floor(scrollRect.left - pageRect.left - pad));
+      iy0 = Math.max(0, Math.floor(scrollRect.top - pageRect.top - pad));
+      ix1 = Math.min(layout.width, Math.ceil(scrollRect.right - pageRect.left + pad));
+      iy1 = Math.min(layout.height, Math.ceil(scrollRect.bottom - pageRect.top + pad));
+    } else {
+      const viewLeft = this._scrollContainer.scrollLeft;
+      const viewTop = this._scrollContainer.scrollTop;
+      const viewW = this._scrollContainer.clientWidth;
+      const viewH = this._scrollContainer.clientHeight;
+      if (viewW <= 0 || viewH <= 0) return null;
+      ix0 = Math.max(0, Math.floor(viewLeft - pad - layout.left));
+      iy0 = Math.max(0, Math.floor(viewTop - pad - layout.top));
+      ix1 = Math.min(layout.width, Math.ceil(viewLeft + viewW + pad - layout.left));
+      iy1 = Math.min(layout.height, Math.ceil(viewTop + viewH + pad - layout.top));
+    }
+
+    const cw = ix1 - ix0;
+    const ch = iy1 - iy0;
+    if (cw <= 8 || ch <= 8) return null;
+    return { x: ix0, y: iy0, width: cw, height: ch };
+  }
+
+  /**
+   * High-DPI Viewport Chunk coordinator: for any visible page at high zoom
+   * (where the full-page base canvas hits the VRAM budget cap), computes the
+   * exact intersection of the page with the scroll container's viewport and
+   * renders ONLY that visible rectangle at 100% native DPI.
+   */
+  private updateVisiblePageChunks(renderPdfRaster: boolean = true): void {
+    if (this._isZoomGestureActive || store.isDocSwitching || store.isZoomAdjusting) return;
+    const doc = store.activeDocument;
+    if (!doc || !this._scrollContainer) return;
+
+    for (const [pageIndex, p] of this._renderedPages) {
+      // Never shift or resize the active page's chunk while a stroke is in flight
+      if (pointerHandler.isPointerDown && pageIndex === pointerHandler.activePageIndex) {
+        continue;
+      }
+
+      const chunkCanvas = p.chunkCanvas;
+      if (!chunkCanvas) continue;
+      const layout = viewportManager.getLayout(pageIndex);
+      const rot = store.pageRotations[pageIndex] || 0;
+      if (!layout || !pdfEngine.needsViewportChunk(pageIndex, store.zoom, rot)) {
+        pdfEngine.cancelPageChunkRender(pageIndex);
+        if (chunkCanvas.style.display !== 'none') {
+          chunkCanvas.style.display = 'none';
+          chunkCanvas.width = 1;
+          chunkCanvas.height = 1;
+          delete chunkCanvas.dataset.chunkKey;
+        }
+        if (p.annotChunkCanvas && p.annotChunkCanvas.style.display !== 'none') {
+          p.annotChunkCanvas.style.display = 'none';
+          p.annotChunkCanvas.width = 1;
+          p.annotChunkCanvas.height = 1;
+          delete p.annotChunkCanvas.dataset.annotKey;
+        }
+        if (p.scratchChunkCanvas && p.scratchChunkCanvas.style.display !== 'none') {
+          p.scratchChunkCanvas.style.display = 'none';
+          p.scratchChunkCanvas.width = 1;
+          p.scratchChunkCanvas.height = 1;
+        }
+        if (layout) {
+          const dpr = resolveAdaptiveCanvasDpr(layout.width, layout.height, store.appSettings.targetDPI);
+          const w = Math.max(1, Math.round(layout.width * dpr));
+          const h = Math.max(1, Math.round(layout.height * dpr));
+          if (p.annotCanvas.width !== w || p.annotCanvas.height !== h || p.annotCanvas.style.opacity !== '') {
+            p.annotCanvas.width = w;
+            p.annotCanvas.height = h;
+            p.annotCanvas.style.opacity = '';
+            this.repaintPageAnnotations(pageIndex, p);
+          }
+        } else if (p.annotCanvas.style.opacity !== '') {
+          p.annotCanvas.style.opacity = '';
+        }
+        continue;
+      }
+
+      const chunkRect = this.computePageViewportChunkRect(p.container, layout);
+      if (!chunkRect) {
+        pdfEngine.cancelPageChunkRender(pageIndex);
+        if (chunkCanvas.style.display !== 'none') {
+          chunkCanvas.style.display = 'none';
+          chunkCanvas.width = 1;
+          chunkCanvas.height = 1;
+          delete chunkCanvas.dataset.chunkKey;
+        }
+        if (p.annotChunkCanvas && p.annotChunkCanvas.style.display !== 'none') {
+          p.annotChunkCanvas.style.display = 'none';
+          p.annotChunkCanvas.width = 1;
+          p.annotChunkCanvas.height = 1;
+          delete p.annotChunkCanvas.dataset.annotKey;
+        }
+        if (p.scratchChunkCanvas && p.scratchChunkCanvas.style.display !== 'none') {
+          p.scratchChunkCanvas.style.display = 'none';
+          p.scratchChunkCanvas.width = 1;
+          p.scratchChunkCanvas.height = 1;
+        }
+        continue;
+      }
+
+      this.updateAnnotationChunkGeometry(pageIndex, p, chunkRect, false);
+      if (renderPdfRaster) {
+        void pdfEngine.renderPageChunkToCanvas(pageIndex, chunkCanvas, store.zoom, rot, chunkRect);
+      }
+    }
+  }
+
+  /**
+   * High-DPI Vector Annotation & Scratchpad Chunk: positions and sizes the
+   * viewport-clipped annotation and scratchpad canvases at 100% native display
+   * DPI so handwriting, shapes, and text remain razor-sharp at up to 800% zoom.
+   */
+  private updateAnnotationChunkGeometry(
+    pageIndex: number,
+    p: {
+      annotCanvas: HTMLCanvasElement;
+      annotChunkCanvas?: HTMLCanvasElement;
+      scratchCanvas: HTMLCanvasElement;
+      scratchChunkCanvas?: HTMLCanvasElement;
+    },
+    chunkRect: { x: number; y: number; width: number; height: number },
+    allocateScratch: boolean = false
+  ): void {
+    const annotChunk = p.annotChunkCanvas;
+    const scratchChunk = p.scratchChunkCanvas;
+    if (!annotChunk || !scratchChunk) return;
+
+    const nativeDpr = resolveAdaptiveCanvasDpr(
+      chunkRect.width,
+      chunkRect.height,
+      Math.max(store.appSettings.targetDPI || 200, 200)
+    );
+    const pw = Math.max(1, Math.round(chunkRect.width * nativeDpr));
+    const ph = Math.max(1, Math.round(chunkRect.height * nativeDpr));
+
+    const isStrokeOnPage = pointerHandler.isPointerDown && pageIndex === pointerHandler.activePageIndex;
+    const targets = isStrokeOnPage ? [annotChunk] : [annotChunk, scratchChunk];
+
+    for (const c of targets) {
+      c.style.left = `${chunkRect.x}px`;
+      c.style.top = `${chunkRect.y}px`;
+      c.style.width = `${chunkRect.width}px`;
+      c.style.height = `${chunkRect.height}px`;
+      c.style.display = 'block';
+      c.dataset.baseZoom = String(store.zoom);
+      c.dataset.baseLeft = String(chunkRect.x);
+      c.dataset.baseTop = String(chunkRect.y);
+      c.dataset.baseWidth = String(chunkRect.width);
+      c.dataset.baseHeight = String(chunkRect.height);
+      c.dataset.offsetX = String(chunkRect.x);
+      c.dataset.offsetY = String(chunkRect.y);
+    }
+
+    if (!isStrokeOnPage) {
+      const needScratch = allocateScratch || pointerHandler.isPolygonActiveOnPage(pageIndex);
+      if (needScratch) {
+        if (scratchChunk.width !== pw || scratchChunk.height !== ph) {
+          scratchChunk.width = pw;
+          scratchChunk.height = ph;
+        }
+      } else if (scratchChunk.width !== 1 || scratchChunk.height !== 1) {
+        scratchChunk.width = 1;
+        scratchChunk.height = 1;
+      }
+      if (p.scratchCanvas.width !== 1 || p.scratchCanvas.height !== 1) {
+        p.scratchCanvas.width = 1;
+        p.scratchCanvas.height = 1;
+      }
+    }
+
+    // Collapse the hidden full-page annotation canvas underneath so it uses 0 VRAM
+    // at high zoom and never double-composites translucent highlighters.
+    p.annotCanvas.style.opacity = '0';
+    if (p.annotCanvas.width !== 1 || p.annotCanvas.height !== 1) {
+      p.annotCanvas.width = 1;
+      p.annotCanvas.height = 1;
+    }
+
+    const annotKey = `${store.zoom.toFixed(4)}|${chunkRect.x},${chunkRect.y},${pw},${ph}`;
+    if (annotChunk.width !== pw || annotChunk.height !== ph || annotChunk.dataset.annotKey !== annotKey) {
+      annotChunk.width = pw;
+      annotChunk.height = ph;
+      annotChunk.dataset.annotKey = annotKey;
+      this.repaintAnnotationChunk(pageIndex, p);
+    }
+  }
+
+  /**
+   * Synchronously prepares the active page's scratchpad backing store and
+   * High-DPI Viewport Chunk right on `pointerdown` before `pointerHandler`
+   * starts a stroke. Guarantees 0ms chunk lag and 100% coordinate lock.
+   */
+  private preparePageForPointerDown(pageIndex: number): void {
+    if (this._chunkUpdateTimer !== null) {
+      window.clearTimeout(this._chunkUpdateTimer);
+      this._chunkUpdateTimer = null;
+    }
+    const p = this._renderedPages.get(pageIndex);
+    const layout = viewportManager.getLayout(pageIndex);
+    if (!p || !layout) return;
+
+    const rot = store.pageRotations[pageIndex] || 0;
+    if (pdfEngine.needsViewportChunk(pageIndex, store.zoom, rot)) {
+      const chunkRect = this.computePageViewportChunkRect(p.container, layout);
+      if (chunkRect) {
+        this.updateAnnotationChunkGeometry(pageIndex, p, chunkRect, true);
+        if (p.chunkCanvas) {
+          void pdfEngine.renderPageChunkToCanvas(pageIndex, p.chunkCanvas, store.zoom, rot, chunkRect);
+        }
+        return;
+      }
+    }
+
+    if (p.scratchChunkCanvas && p.scratchChunkCanvas.style.display !== 'none') {
+      p.scratchChunkCanvas.style.display = 'none';
+      p.scratchChunkCanvas.width = 1;
+      p.scratchChunkCanvas.height = 1;
+    }
+    const dpr = resolveAdaptiveCanvasDpr(layout.width, layout.height, store.appSettings.targetDPI);
+    const w = Math.max(1, Math.round(layout.width * dpr));
+    const h = Math.max(1, Math.round(layout.height * dpr));
+    if (p.scratchCanvas.width !== w || p.scratchCanvas.height !== h) {
+      p.scratchCanvas.width = w;
+      p.scratchCanvas.height = h;
+    }
+    delete p.scratchCanvas.dataset.offsetX;
+    delete p.scratchCanvas.dataset.offsetY;
+  }
+
+  /**
+   * Releases the temporary scratchpad backing store back to 1x1 once a stroke
+   * finishes so idle pages consume 0 bytes of scratchpad VRAM.
+   */
+  private releasePageScratchpad(pageIndex: number): void {
+    if (pointerHandler.isPolygonActiveOnPage(pageIndex)) return;
+    const p = this._renderedPages.get(pageIndex);
+    if (!p) return;
+    if (p.scratchCanvas.width !== 1 || p.scratchCanvas.height !== 1) {
+      p.scratchCanvas.width = 1;
+      p.scratchCanvas.height = 1;
+    }
+    if (p.scratchChunkCanvas && (p.scratchChunkCanvas.width !== 1 || p.scratchChunkCanvas.height !== 1)) {
+      p.scratchChunkCanvas.width = 1;
+      p.scratchChunkCanvas.height = 1;
+    }
+  }
+
+  private repaintAnnotationChunk(
+    pageIndex: number,
+    p: { annotCanvas: HTMLCanvasElement; annotChunkCanvas?: HTMLCanvasElement }
+  ): void {
+    const chunk = p.annotChunkCanvas;
+    if (!chunk || chunk.style.display !== 'block' || chunk.width <= 1 || chunk.height <= 1) return;
+    const baseW = parseFloat(chunk.dataset.baseWidth || '') || parseFloat(chunk.style.width) || chunk.width;
+    const baseZoom = parseFloat(chunk.dataset.baseZoom || '') || store.zoom;
+    const dpr = baseW > 0 ? chunk.width / baseW : 1;
+    const scale = baseZoom * dpr;
+    const ox = parseFloat(chunk.dataset.offsetX || '0');
+    const oy = parseFloat(chunk.dataset.offsetY || '0');
+
+    const ctx = chunk.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, chunk.width, chunk.height);
+
+    ctx.save();
+    ctx.translate(-ox * dpr, -oy * dpr);
+
+    const layout = viewportManager.getLayout(pageIndex);
+    const fullW = layout ? Math.round((layout.width / Math.max(store.zoom, 0.0001)) * scale) : chunk.width;
+    const fullH = layout ? Math.round((layout.height / Math.max(store.zoom, 0.0001)) * scale) : chunk.height;
+
+    annotationEngine.renderBackgroundPattern(
+      ctx,
+      fullW,
+      fullH,
+      notebookController.isNotebook() ? 'none' : store.appSettings.backgroundPattern,
+      scale,
+      store.appSettings.gridSize
+    );
+
+    annotationEngine.renderAnnotationsToCanvas(ctx, pageIndex, scale);
+
+    const doc = store.activeDocument;
+    if (doc) {
+      const pageAnns = doc.annotations[pageIndex] || [];
+      const selected = pageAnns.filter(a => store.selectedAnnotationIds.has(a.id));
+      if (selected.length > 0) {
+        selectionManager.render(ctx, selected, scale);
+      }
+    }
+
+    ctx.restore();
   }
 
   /** Applies Settings → default zoom for brand-new documents. */
@@ -910,6 +1281,16 @@ class VeditorApp {
         this.previewZoomBy(factor, { x: e.clientX, y: e.clientY });
       }
     }, { passive: false });
+
+    // Refresh High-DPI Viewport Chunk when panning/scrolling at high zoom:
+    // vector annotations & scratchpad chunk geometry update immediately (0ms lag)
+    // while the async PDF.js raster chunk updates after a brief 75ms settle.
+    this._scrollContainer.addEventListener('scroll', () => {
+      if (!this._isZoomGestureActive && store.activeDocument) {
+        this.updateVisiblePageChunks(false);
+        this.scheduleChunkUpdate(75);
+      }
+    }, { passive: true });
 
     // Keyboard shortcuts for zoom
     window.addEventListener('keydown', (e) => {
@@ -970,9 +1351,17 @@ class VeditorApp {
         pdfEngine.cancelPageRender(pageIndex);
         // Explicitly collapse backing stores to 1x1 to release VRAM buffers immediately
         p.pdfCanvas.width = 1; p.pdfCanvas.height = 1;
-        p.patternCanvas.width = 1; p.patternCanvas.height = 1;
+        if (p.chunkCanvas) {
+          p.chunkCanvas.width = 1; p.chunkCanvas.height = 1;
+        }
         p.annotCanvas.width = 1; p.annotCanvas.height = 1;
+        if (p.annotChunkCanvas) {
+          p.annotChunkCanvas.width = 1; p.annotChunkCanvas.height = 1;
+        }
         p.scratchCanvas.width = 1; p.scratchCanvas.height = 1;
+        if (p.scratchChunkCanvas) {
+          p.scratchChunkCanvas.width = 1; p.scratchChunkCanvas.height = 1;
+        }
 
         if (p.container.parentNode === this._pagesWrapper) {
           this._pagesWrapper.removeChild(p.container);
@@ -1005,7 +1394,6 @@ class VeditorApp {
       }
 
       if (!pageElements) {
-        // Create container and 4-layer canvas architecture
         const container = document.createElement('div');
         container.className = 'pdf-page-container';
         container.dataset.pageIndex = String(pageIndex);
@@ -1016,11 +1404,16 @@ class VeditorApp {
         pdfCanvas.dataset.pageIndex = String(pageIndex);
         pdfCanvas.dataset.docId = docId;
 
-        const patternCanvas = document.createElement('canvas');
-        patternCanvas.className = 'pattern-canvas';
+        const chunkCanvas = document.createElement('canvas');
+        chunkCanvas.className = 'pdf-page-canvas pdf-chunk-canvas';
+        chunkCanvas.dataset.pageIndex = String(pageIndex);
+        chunkCanvas.dataset.docId = docId;
 
         const annotCanvas = document.createElement('canvas');
         annotCanvas.className = 'annotation-canvas';
+
+        const annotChunkCanvas = document.createElement('canvas');
+        annotChunkCanvas.className = 'annotation-canvas annot-chunk-canvas';
 
         const scratchCanvas = document.createElement('canvas');
         scratchCanvas.className = 'scratchpad-canvas';
@@ -1030,14 +1423,28 @@ class VeditorApp {
           store.zoom
         );
 
+        const scratchChunkCanvas = document.createElement('canvas');
+        scratchChunkCanvas.className = 'scratch-chunk-canvas';
+        (scratchCanvas as HTMLCanvasElement & { _chunkCanvas?: HTMLCanvasElement })._chunkCanvas = scratchChunkCanvas;
+
         container.appendChild(pdfCanvas);
-        container.appendChild(patternCanvas);
+        container.appendChild(chunkCanvas);
         container.appendChild(annotCanvas);
+        container.appendChild(annotChunkCanvas);
         container.appendChild(scratchCanvas);
+        container.appendChild(scratchChunkCanvas);
 
         this._pagesWrapper.appendChild(container);
 
-        pageElements = { container, pdfCanvas, patternCanvas, annotCanvas, scratchCanvas };
+        pageElements = {
+          container,
+          pdfCanvas,
+          chunkCanvas,
+          annotCanvas,
+          annotChunkCanvas,
+          scratchCanvas,
+          scratchChunkCanvas
+        };
         this._renderedPages.set(pageIndex, pageElements);
 
         // Bind Pointer Events to scratchpad canvas
@@ -1048,9 +1455,7 @@ class VeditorApp {
     // 3. Geometry pass over EVERY mounted page. Retained pages outside the
     // visible set are still positioned and sized here; leaving them at the
     // previous zoom's top/size is what painted stale pages on top of the
-    // corrected ones after a zoom ("everything mixes together"). Their raster
-    // is dropped rather than re-rendered — they are offscreen by definition
-    // and pdfEngine's bitmap cache makes the re-entry render instant.
+    // corrected ones after a zoom ("everything mixes together").
     for (const [pageIndex, p] of Array.from(this._renderedPages.entries())) {
       if (!docStillCurrent()) return;
       const layout = viewportManager.getLayout(pageIndex);
@@ -1066,6 +1471,30 @@ class VeditorApp {
       this.applyPageGeometry(pageIndex, p, layout, docId);
     }
 
+    // While an interactive wheel/pinch zoom gesture is in flight, existing
+    // canvas bitmaps are stretched via CSS width/height with zero re-raster
+    // or canvas clearing; commitZoomPreview() runs the crisp pass once settled.
+    if (this._isZoomGestureActive) {
+      for (const [pageIndex, p] of Array.from(this._renderedPages.entries())) {
+        if (!docStillCurrent()) return;
+        // Only paint newly mounted pages that had no prior bitmap at all
+        if (p.needsRepaint) {
+          p.needsRepaint = false;
+          this.repaintPageAnnotations(pageIndex, p);
+        }
+        if (p.needsRaster && p.pdfCanvas.width <= 300) {
+          p.needsRaster = false;
+          const rot = store.pageRotations[pageIndex] || 0;
+          void pdfEngine.renderPageToCanvas(pageIndex, p.pdfCanvas, store.zoom, rot);
+        }
+      }
+      return;
+    }
+
+    // Update High-DPI Viewport Chunks synchronously right in the layout/render pass
+    // so annotation & scratchpad chunks never lag by a timer after zoom/scroll.
+    this.updateVisiblePageChunks(true);
+
     // 4. Render pass: rasterise and repaint. Visible pages always repaint;
     // pages whose backing stores were just resized repaint exactly once, and
     // the PDF raster is only regenerated for a page that is on screen.
@@ -1079,15 +1508,9 @@ class VeditorApp {
           const rot = store.pageRotations[pageIndex] || 0;
           void pdfEngine.renderPageToCanvas(pageIndex, p.pdfCanvas, store.zoom, rot);
         }
-        // An on-screen page always repaints, so a pending flag for it is
-        // redundant — clearing it here keeps the offscreen pages' single
-        // deferred repaint from doubling up on the visible ones.
         p.needsRepaint = false;
         this.repaintPageAnnotations(pageIndex, p);
       } else if (p.needsRepaint) {
-        // Offscreen but its backing stores were resized: repaint now so the
-        // layers are correct the moment it scrolls back in. The PDF raster
-        // itself stays deferred until it is actually on screen.
         p.needsRepaint = false;
         this.repaintPageAnnotations(pageIndex, p);
       }
@@ -1096,19 +1519,29 @@ class VeditorApp {
 
   /**
    * Positions and sizes one mounted page from its viewport layout rect, and
-   * flags the layers for regeneration when anything actually changed. Split out
-   * of renderVisiblePages so retained (offscreen) pages are reconciled too.
+   * flags the layers for regeneration when anything actually changed.
    */
   private applyPageGeometry(
     pageIndex: number,
-    p: { container: HTMLElement; pdfCanvas: HTMLCanvasElement; patternCanvas: HTMLCanvasElement; annotCanvas: HTMLCanvasElement; scratchCanvas: HTMLCanvasElement; geomKey?: string; needsRaster?: boolean; needsRepaint?: boolean },
+    p: {
+      container: HTMLElement;
+      pdfCanvas: HTMLCanvasElement;
+      chunkCanvas?: HTMLCanvasElement;
+      annotCanvas: HTMLCanvasElement;
+      annotChunkCanvas?: HTMLCanvasElement;
+      scratchCanvas: HTMLCanvasElement;
+      scratchChunkCanvas?: HTMLCanvasElement;
+      geomKey?: string;
+      needsRaster?: boolean;
+      needsRepaint?: boolean;
+    },
     layout: { top: number; left: number; width: number; height: number },
     docId: string
   ): void {
-    const dpr = clampRenderMultiplier(
+    const dpr = resolveAdaptiveCanvasDpr(
       layout.width,
       layout.height,
-      resolveAnnotationDpr(store.appSettings.targetDPI)
+      store.appSettings.targetDPI
     );
     const rot = store.pageRotations[pageIndex] || 0;
     const geomKey = `${store.zoom.toFixed(4)}|${dpr.toFixed(4)}|${rot}`;
@@ -1124,75 +1557,108 @@ class VeditorApp {
     p.pdfCanvas.style.width = `${layout.width}px`;
     p.pdfCanvas.style.height = `${layout.height}px`;
 
-    // Whole-pixel backing stores: fractional canvas sizes are truncated by
-    // the browser, leaving a sub-pixel mismatch against the CSS size that
-    // slightly resamples (and softens/aliases) every stroke.
-    const w = Math.round(layout.width * dpr);
-    const h = Math.round(layout.height * dpr);
-
-    // Avoid clearing canvas buffers if dimensions haven't changed!
-    let resized = false;
-    [p.patternCanvas, p.annotCanvas, p.scratchCanvas].forEach(c => {
-      if (c.width !== w || c.height !== h) {
-        c.width = w;
-        c.height = h;
-        c.style.width = `${layout.width}px`;
-        c.style.height = `${layout.height}px`;
-        resized = true;
+    // Scale any active High-DPI Viewport Chunks proportionally with the page
+    // so they stay locked to their page region while zooming before the new chunk renders.
+    for (const chunk of [p.chunkCanvas, p.annotChunkCanvas, p.scratchChunkCanvas]) {
+      if (chunk && chunk.style.display === 'block') {
+        const baseZoom = parseFloat(chunk.dataset.baseZoom || '0');
+        if (baseZoom > 0) {
+          const ratio = store.zoom / baseZoom;
+          const bl = parseFloat(chunk.dataset.baseLeft || '0');
+          const bt = parseFloat(chunk.dataset.baseTop || '0');
+          const bw = parseFloat(chunk.dataset.baseWidth || '0');
+          const bh = parseFloat(chunk.dataset.baseHeight || '0');
+          chunk.style.left = `${bl * ratio}px`;
+          chunk.style.top = `${bt * ratio}px`;
+          chunk.style.width = `${bw * ratio}px`;
+          chunk.style.height = `${bh * ratio}px`;
+        }
       }
-    });
+    }
 
-    if (resized) {
-      // A resized backing store is blank, so both the raster and the layers
-      // are stale regardless of whether the signature changed (e.g. DPI edits
-      // round to the same multiplier).
-      p.needsRepaint = true;
-      if (p.pdfCanvas.width !== w || p.pdfCanvas.height !== h) {
-        p.pdfCanvas.width = w;
-        p.pdfCanvas.height = h;
+    // ALWAYS update CSS width/height on annotation and scratchpad canvases so
+    // they cover 100% of the page even when the pixel backing store hits the
+    // adaptive VRAM ceiling!
+    p.annotCanvas.style.width = `${layout.width}px`;
+    p.annotCanvas.style.height = `${layout.height}px`;
+    p.scratchCanvas.style.width = `${layout.width}px`;
+    p.scratchCanvas.style.height = `${layout.height}px`;
+
+    // During an active wheel/pinch zoom gesture, keep the existing canvas
+    // backing stores intact (CSS stretches them smoothly with zero flicker)
+    // unless this is a brand-new uninitialized page.
+    if (this._isZoomGestureActive && p.geomKey !== undefined) {
+      return;
+    }
+
+    const useChunk = pdfEngine.needsViewportChunk(pageIndex, store.zoom, rot);
+    const w = Math.max(1, Math.round(layout.width * dpr));
+    const h = Math.max(1, Math.round(layout.height * dpr));
+
+    if (!useChunk) {
+      if (p.annotCanvas.width !== w || p.annotCanvas.height !== h) {
+        p.annotCanvas.width = w;
+        p.annotCanvas.height = h;
+        p.needsRepaint = true;
       }
-      p.needsRaster = true;
+      if (p.annotCanvas.style.opacity !== '') {
+        p.annotCanvas.style.opacity = '';
+      }
+    }
+
+    // Keep idle scratchpad backing stores at 1x1 to save VRAM; allocated on-demand on pointerdown.
+    const isStrokeOnPage = pointerHandler.isPointerDown && pageIndex === pointerHandler.activePageIndex;
+    if (!isStrokeOnPage && !pointerHandler.isPolygonActiveOnPage(pageIndex)) {
+      if (p.scratchCanvas.width !== 1 || p.scratchCanvas.height !== 1) {
+        p.scratchCanvas.width = 1;
+        p.scratchCanvas.height = 1;
+      }
     }
 
     if (p.geomKey !== geomKey) {
       p.geomKey = geomKey;
-      if (p.pdfCanvas.width !== w || p.pdfCanvas.height !== h) {
-        p.pdfCanvas.width = w;
-        p.pdfCanvas.height = h;
-      }
       p.needsRaster = true;
+      p.needsRepaint = true;
     }
   }
 
   private repaintPageAnnotations(
     pageIndex: number,
-    p: { patternCanvas: HTMLCanvasElement; annotCanvas: HTMLCanvasElement; scratchCanvas: HTMLCanvasElement }
+    p: {
+      annotCanvas: HTMLCanvasElement;
+      annotChunkCanvas?: HTMLCanvasElement;
+      scratchCanvas: HTMLCanvasElement;
+    }
   ) {
-    const cssW = parseFloat(p.patternCanvas.style.width) || p.patternCanvas.width;
-    const cssH = parseFloat(p.patternCanvas.style.height) || p.patternCanvas.height;
-    const dpr = clampRenderMultiplier(cssW, cssH, resolveAnnotationDpr(store.appSettings.targetDPI));
-    const scale = store.zoom * dpr;
+    // When the High-DPI Viewport Annotation Chunk is active, skip rendering onto
+    // the hidden full-page annotCanvas underneath (saves 50% CPU and 100% full-page annotCanvas VRAM).
+    if (p.annotChunkCanvas && p.annotChunkCanvas.style.display === 'block' && p.annotChunkCanvas.width > 1) {
+      this.repaintAnnotationChunk(pageIndex, p);
+      return;
+    }
 
-    // 1. Background paper pattern
-    const patCtx = p.patternCanvas.getContext('2d');
-    if (patCtx) {
-      patCtx.clearRect(0, 0, p.patternCanvas.width, p.patternCanvas.height);
-      // A notebook already has its paper drawn into the PDF, so the overlay
-      // grid is only for imported documents.
+    const layout = viewportManager.getLayout(pageIndex);
+    const cssW = layout ? layout.width : (parseFloat(p.annotCanvas.style.width) || p.annotCanvas.width);
+    const baseW = cssW / Math.max(store.zoom, 0.0001);
+    const scale = baseW > 0 && p.annotCanvas.width > 1
+      ? p.annotCanvas.width / baseW
+      : store.zoom * resolveAdaptiveCanvasDpr(cssW, layout ? layout.height : p.annotCanvas.height, store.appSettings.targetDPI);
+
+    const annCtx = p.annotCanvas.getContext('2d');
+    if (annCtx && p.annotCanvas.width > 1 && p.annotCanvas.height > 1) {
+      annCtx.clearRect(0, 0, p.annotCanvas.width, p.annotCanvas.height);
+
+      // 1. Background paper pattern (consolidated onto the single overlay canvas)
       annotationEngine.renderBackgroundPattern(
-        patCtx,
-        p.patternCanvas.width,
-        p.patternCanvas.height,
+        annCtx,
+        p.annotCanvas.width,
+        p.annotCanvas.height,
         notebookController.isNotebook() ? 'none' : store.appSettings.backgroundPattern,
         scale,
         store.appSettings.gridSize
       );
-    }
 
-    // 2. Committed Annotations & Selection Box
-    const annCtx = p.annotCanvas.getContext('2d');
-    if (annCtx) {
-      annCtx.clearRect(0, 0, p.annotCanvas.width, p.annotCanvas.height);
+      // 2. Committed Annotations & Selection Box
       annotationEngine.renderAnnotationsToCanvas(annCtx, pageIndex, scale);
 
       // Render selection handles if active on this page
@@ -1315,6 +1781,9 @@ class VeditorApp {
       try {
         canvas.setPointerCapture(e.pointerId);
       } catch (_) {}
+      // Synchronously align the High-DPI Viewport Chunk and allocate the
+      // scratchpad backing store BEFORE pointerHandler starts the stroke.
+      this.preparePageForPointerDown(pageIndex);
       pointerHandler.handlePointerDown(e, pageIndex, canvas, onRepaint);
     });
 
@@ -1338,6 +1807,9 @@ class VeditorApp {
         // Polygon vertices are placed on click, so its elastic edge must also
         // receive unpressed moves. `handlePointerMove` returns immediately for
         // every other inactive tool.
+        if (store.activeTool === 'polygon' && pointerHandler.isPolygonActiveOnPage(pageIndex)) {
+          this.preparePageForPointerDown(pageIndex);
+        }
         pointerHandler.handlePointerMove(e, pageIndex, canvas, onRepaint);
         return;
       }
@@ -1373,6 +1845,7 @@ class VeditorApp {
         canvas.releasePointerCapture(e.pointerId);
       } catch (_) {}
       pointerHandler.handlePointerUp(e, pageIndex, canvas, onRepaint);
+      this.releasePageScratchpad(pageIndex);
       // A notebook grows once the stroke is committed, so there is always
       // blank paper below what you just wrote.
       void notebookController.autoExtend(pageIndex);
@@ -1401,29 +1874,39 @@ class VeditorApp {
         canvas.releasePointerCapture(e.pointerId);
       } catch (_) {}
       pointerHandler.handlePointerUp(e, pageIndex, canvas, onRepaint);
+      this.releasePageScratchpad(pageIndex);
     });
 
     canvas.addEventListener('dblclick', (e) => {
       e.preventDefault();
       const finished = pointerHandler.finishPolygon(pageIndex, 'layer-default', onRepaint);
-      if (finished) return;
-      if (store.activeTool !== 'hand') return;
-      // The hand tool remains an efficient navigation mode, but double-click
-      // is an intentional editing gesture. Pick the topmost unlocked item
-      // directly rather than forwarding a synthetic pointer event (which
-      // could begin a pan or lasso drag).
-      if (store.activeTool === 'hand') {
+      if (finished) {
+        this.releasePageScratchpad(pageIndex);
+        return;
+      }
+
+      // Double-clicking a TextAnnotation in Select, Hand, or Text mode opens
+      // the inline text editor directly over the annotation on the page.
+      if (store.activeTool === 'select' || store.activeTool === 'hand' || store.activeTool === 'text') {
         const point = pointerHandler.pagePointForEvent(e, canvas);
         const hit = selectionManager.findAnnotationAtPoint(
           point, store.activeDocument?.annotations[pageIndex] || []
         );
-        if (hit) {
+        if (hit && hit.type === 'text') {
+          store.setActiveTool('select');
+          store.selectAnnotation(hit.id);
+          pointerHandler.editExistingTextAnnotation(hit, pageIndex, canvas, onRepaint);
+          return;
+        }
+        if (hit && store.activeTool === 'hand') {
           store.setActiveTool('select');
           store.selectAnnotation(hit.id);
           onRepaint();
           return;
         }
       }
+
+      if (store.activeTool !== 'hand') return;
       // Toggle: zoomed out → 200% at click; zoomed in → fit width.
       this.commitZoomPreview();
       if (pointerHandler.isPointerDown || this._handPan) return;
@@ -1799,16 +2282,27 @@ class VeditorApp {
       store.setShortcutsModalOpen(true);
     }
 
-    if (docId) {
-      const session = await getDocumentSession(docId);
+    let savedSessionId: string | null = null;
+    try {
+      if (typeof window !== 'undefined' && window.sessionStorage) {
+        savedSessionId = sessionStorage.getItem('veditor:active-doc-id');
+      }
+    } catch (_) {}
+
+    const targetDocId = docId || savedSessionId;
+    if (targetDocId) {
+      const session = await getDocumentSession(targetDocId);
       if (session && session.fileData) {
-        await this.loadPDF(session.name, session.fileData, docId, session.notebook, {
+        await this.loadPDF(session.name, session.fileData, targetDocId, session.notebook, {
           activePageIndex: session.activePageIndex || 0,
           savedScrollTop: session.savedScrollTop,
           savedScrollLeft: session.savedScrollLeft
         });
+        return;
       }
-    } else if (pdfUrl) {
+    }
+
+    if (pdfUrl) {
       try {
         showToast(`Fetching ${pdfUrl}…`, 'progress');
         const res = await fetch(pdfUrl);
