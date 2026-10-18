@@ -6,4 +6,5 @@ src-tauri/target/
 src-tauri/gen/
 .aistudio/
 metadata.json
+bun.lock
 

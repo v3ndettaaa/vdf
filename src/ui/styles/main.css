@@ -692,48 +692,60 @@ body.no-page-shadows .pdf-page-container {
 }
 
 .size-readout {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  min-width: 26px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  min-width: 0;
   text-align: right;
 }
 
-/* Free-typed numeric + hex inputs inside tool hover cards. */
-.size-type-input {
-  width: 44px;
+/* Free-typed numeric + hex inputs inside tool hover cards.
+   Native spin arrows are stripped so they never overlap the digits. */
+.size-type-input,
+input.prop-num-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
+  width: 32px;
   min-width: 0;
-  padding: 1px 3px;
-  font-size: 11px;
-  font-weight: 600;
+  padding: 0;
+  margin: 0;
+  font-family: var(--font-family);
+  font-size: 11.5px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
-  text-align: center;
+  text-align: right;
   color: var(--text-primary);
-  background: var(--bg-surface-elevated);
-  border: 1px solid var(--border-medium);
-  border-radius: 4px;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
   outline: none;
 }
 
-.size-type-input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-subtle);
+.size-type-input::-webkit-outer-spin-button,
+.size-type-input::-webkit-inner-spin-button,
+input.prop-num-input::-webkit-outer-spin-button,
+input.prop-num-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .hex-type-input {
-  width: 62px;
-  padding: 1px 4px;
+  width: 68px;
+  padding: 2px 6px;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-secondary);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 4px;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
   outline: none;
+  text-align: center;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
 }
 
 .hex-type-input:hover {
   border-color: var(--border-medium);
+  color: var(--text-primary);
 }
 
 .hex-type-input:focus {
@@ -746,16 +758,17 @@ body.no-page-shadows .pdf-page-container {
 .mode-toggle-btn {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
-  padding: 3px 8px;
-  border-radius: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
   font-size: 11px;
   font-weight: 600;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
   white-space: nowrap;
 }
 
@@ -765,141 +778,692 @@ body.no-page-shadows .pdf-page-container {
 }
 
 .mode-toggle-btn.active {
-  background: var(--accent);
-  color: #ffffff;
+  background: var(--bg-surface-active);
+  color: var(--text-primary);
+  border-color: var(--border-medium);
 }
 
-/* Tool Button Wrapper & Click-Pinned Popover Cards */
+/* Tool Button Wrapper & Goodnotes-Inspired Vertical Popover Cards */
 
-/* Deliberately NOT a containing block: the pinned cards inside it are
-   absolutely positioned against `.floating-toolbar` so they centre under the
-   whole toolbar instead of under one narrow button. Anchoring them to the
-   button pushed the wide cards (the pen card is ~1200px) off-screen for every
-   tool that is not near the middle of the toolbar. `.tool-color-dot` still has
-   a positioned host because `.tool-btn` is `position: relative`. */
 .tool-btn-wrapper {
   display: inline-flex;
 }
 
 .tool-color-dot {
   position: absolute;
-  bottom: 3px;
-  right: 4px;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  box-shadow: 0 0 2px rgba(0,0,0,0.5);
+  bottom: 4px;
+  left: 8px;
+  right: 12px;
+  height: 2.5px;
+  border-radius: 99px;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.45);
   pointer-events: none;
 }
 
-/* The options row for the hovered/pinned tool. It reads as a second toolbar
-   row rather than a per-button tooltip: it is centred on the toolbar and never
-   wider than it, so it can't run off-screen the way a button-anchored popover
-   did (the pen card is ~1200px wide, so every tool except the middle few lost
-   controls past the viewport edge).
-
-   The containing block is `.toolbar-main-row` (its `backdrop-filter` makes it
-   one; `.tool-btn-wrapper` is deliberately left unpositioned), so `100%` is
-   the toolbar width. `inset-inline: 0` + `margin-inline: auto` rather than
-   `left: 50%` because shrink-to-fit against a 50% offset would only ever get
-   half the toolbar. Sections wrap onto further lines instead of scrolling, so
-   every control stays reachable without a swipe -- which matters most on the
-   stylus and touch devices this app targets.
-
-   No `overflow` here on purpose: it would clip the ::before hover bridge below
-   and break moving the pointer from the button down into the card. */
-.tool-hover-card {
+.tool-chevron {
   position: absolute;
-  top: calc(100% + 10px);
-  inset-inline: 0;
-  margin-inline: auto;
-  width: max-content;
-  max-width: 100%;
-  transform: translateY(4px);
-  flex-wrap: wrap;
-  row-gap: 8px;
-  justify-content: center;
-  background: var(--bg-glass);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid var(--border-medium);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.35), 0 4px 12px rgba(0, 0, 0, 0.2);
-  padding: 8px 14px;
-  display: flex;
+  bottom: 2px;
+  right: 2px;
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
+  justify-content: center;
+  opacity: 0.55;
+  pointer-events: none;
+  transition: transform 0.16s ease, opacity 0.16s ease;
+}
+
+.tool-btn:hover .tool-chevron,
+.tool-btn.active .tool-chevron {
+  opacity: 0.9;
+}
+
+.tool-btn-wrapper.is-pinned .tool-chevron {
+  transform: rotate(180deg);
+  opacity: 1;
+}
+
+.tool-hover-card.gn-popover {
+  --gn-arrow-pos: 50%;
+  position: absolute;
+  top: calc(100% + 12px);
+  left: 0;
+  width: 316px;
+  max-width: calc(100vw - 24px);
+  transform: translateY(6px) scale(0.98);
+  transform-origin: top center;
+  background: var(--bg-surface);
+  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--border-medium);
+  border-radius: 18px;
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.55), 0 4px 14px rgba(0, 0, 0, 0.28);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
   z-index: 100;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1), transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  white-space: normal;
+}
+
+@media (max-height: 640px) {
+  .tool-hover-card.gn-popover {
+    max-height: calc(100vh - 88px);
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+}
+
+.tool-hover-card.gn-popover.gn-popover-compact {
+  width: 268px;
+}
+
+.gn-popover-arrow {
+  position: absolute;
+  top: -6px;
+  left: var(--gn-arrow-pos);
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-medium);
+  border-left: 1px solid var(--border-medium);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.tool-btn-wrapper.is-pinned .tool-hover-card.gn-popover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+}
+
+.floating-toolbar[data-dock='bottom'] .tool-hover-card.gn-popover {
+  top: auto;
+  bottom: calc(100% + 12px);
+  transform: translateY(-6px) scale(0.98);
+  transform-origin: bottom center;
+}
+
+.floating-toolbar[data-dock='bottom'] .gn-popover-arrow {
+  top: auto;
+  bottom: -6px;
+  border-top: none;
+  border-left: none;
+  border-bottom: 1px solid var(--border-medium);
+  border-right: 1px solid var(--border-medium);
+}
+
+.floating-toolbar[data-dock='bottom'] .tool-btn-wrapper.is-pinned .tool-hover-card.gn-popover {
+  transform: translateY(0) scale(1);
+}
+
+.floating-toolbar[data-dock='left'] .tool-hover-card.gn-popover,
+.floating-toolbar[data-dock='right'] .tool-hover-card.gn-popover {
+  top: 0;
+  bottom: auto;
+  width: 316px;
+}
+
+.floating-toolbar[data-dock='left'] .tool-hover-card.gn-popover {
+  left: calc(100% + 12px);
+  right: auto;
+  transform: translateX(6px) scale(0.98);
+  transform-origin: left center;
+}
+
+.floating-toolbar[data-dock='left'] .gn-popover-arrow {
+  top: var(--gn-arrow-pos);
+  left: -6px;
+  margin-left: 0;
+  margin-top: -6px;
+  border-top: none;
+  border-right: none;
+  border-bottom: 1px solid var(--border-medium);
+  border-left: 1px solid var(--border-medium);
+}
+
+.floating-toolbar[data-dock='right'] .tool-hover-card.gn-popover {
+  right: calc(100% + 12px);
+  left: auto;
+  transform: translateX(-6px) scale(0.98);
+  transform-origin: right center;
+}
+
+.floating-toolbar[data-dock='right'] .gn-popover-arrow {
+  top: var(--gn-arrow-pos);
+  left: auto;
+  right: -6px;
+  margin-left: 0;
+  margin-top: -6px;
+  border-bottom: none;
+  border-left: none;
+  border-top: 1px solid var(--border-medium);
+  border-right: 1px solid var(--border-medium);
+}
+
+.floating-toolbar[data-dock='left'] .tool-btn-wrapper.is-pinned .tool-hover-card.gn-popover,
+.floating-toolbar[data-dock='right'] .tool-btn-wrapper.is-pinned .tool-hover-card.gn-popover {
+  transform: translateX(0) scale(1);
+}
+
+/* Goodnotes Popover Header */
+.gn-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px;
+}
+
+.gn-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.gn-card-meta {
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+/* Goodnotes Live Stroke / Shape Preview Stage */
+.gn-preview-stage {
+  position: relative;
+  width: 100%;
+  height: 68px;
+  border-radius: 12px;
+  background-color: var(--bg-surface-elevated);
+  background-image:
+    linear-gradient(to right, var(--border-subtle) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--border-subtle) 1px, transparent 1px);
+  background-size: 16px 16px;
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.gn-preview-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.gn-text-preview-stage {
+  padding: 0 12px;
+}
+
+.gn-text-preview-sample {
+  font-weight: 600;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  transition: font-size 0.1s ease, color 0.1s ease;
+}
+
+/* Goodnotes Sections & Hairline Dividers */
+.gn-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gn-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.gn-section-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
   white-space: nowrap;
 }
 
-/* Invisible bridge so moving cursor into the card doesn't drop hover */
-.tool-hover-card::before {
+.gn-size-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.gn-num-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 24px;
+  padding: 0 8px;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-medium);
+  border-radius: 8px;
+  flex-shrink: 0;
+  cursor: text;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.gn-num-badge:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-surface-hover);
+}
+
+.gn-num-badge:focus-within {
+  border-color: var(--accent);
+  background: var(--bg-surface);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+.gn-unit {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  line-height: 1;
+  user-select: none;
+}
+
+.gn-preset-grid {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+}
+
+.gn-preset-grid.cols-6 {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.gn-preset-grid .size-pill {
+  width: 100%;
+  min-width: 0;
+  padding: 0 4px;
+  border-radius: 7px;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+}
+
+.gn-preset-grid .size-pill.active {
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.gn-divider {
+  width: 100%;
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 1px 0;
+}
+
+/* Goodnotes Visual Icon Tile Grid */
+.gn-tile-grid {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+}
+
+.gn-tile-grid.cols-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.gn-tile-grid.cols-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.gn-tile-grid.cols-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.gn-icon-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 9px 6px;
+  border-radius: 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+}
+
+.gn-icon-tile.is-compact {
+  padding: 6px 4px;
+  gap: 3px;
+  border-radius: 10px;
+}
+
+.gn-icon-tile:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.gn-icon-tile.active {
+  background: var(--bg-surface-active);
+  color: var(--text-primary);
+  border-color: var(--border-medium);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+.gn-icon-tile.active .gn-tile-icon {
+  color: var(--accent);
+}
+
+.gn-tile-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: currentColor;
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+
+.gn-icon-tile:hover .gn-tile-icon {
+  transform: translateY(-1px);
+}
+
+.gn-tile-label {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.gn-font-glyph {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.gn-icon-tile.active .gn-font-glyph {
+  color: var(--accent);
+}
+
+/* Quick Visual Size Dots Strip */
+.gn-dots-strip {
+  gap: 3px;
+}
+
+.gn-dot-btn {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+/* Goodnotes Smooth Filled Range Slider */
+.gn-slider-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 24px;
+}
+
+.gn-slider-wrap.gn-slider-notched::before {
   content: '';
   position: absolute;
-  top: -12px;
-  left: 0;
-  right: 0;
+  left: 10px;
+  right: 10px;
+  top: 50%;
+  height: 8px;
+  transform: translateY(-50%);
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--border-strong) 0px,
+    var(--border-strong) 2px,
+    transparent 2px,
+    transparent 25%
+  );
+  pointer-events: none;
+  opacity: 0.55;
+  z-index: 0;
+}
+
+.gn-range-slider {
+  --slider-pct: 50%;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--slider-pct),
+    var(--bg-surface-active) var(--slider-pct),
+    var(--bg-surface-active) 100%
+  );
+  outline: none;
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  margin: 0;
+}
+
+.gn-range-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3.5px solid #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 0, 0, 0.15);
+  cursor: grab;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.gn-range-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.12);
+}
+
+.gn-range-slider::-webkit-slider-thumb:active {
+  cursor: grabbing;
+  transform: scale(1.16);
+  box-shadow: 0 0 0 4px var(--accent-glow);
+}
+
+.gn-range-slider::-moz-range-thumb {
+  width: 14px;
   height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3.5px solid #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+  cursor: grab;
+  transition: transform 0.12s ease;
 }
 
-.tool-btn-wrapper.is-pinned .tool-hover-card {
-  opacity: 1;
-  pointer-events: auto;
-  transform: translateY(0);
+/* Swatch Grid inside Popover */
+.gn-swatch-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
-.floating-toolbar[data-dock='bottom'] .tool-hover-card {
-  top: auto;
-  bottom: calc(100% + 10px);
-  transform: translateY(-4px);
+.color-swatch.gn-nofill-swatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface-elevated);
+  border: 1.5px solid var(--border-medium);
+  color: var(--text-secondary);
 }
 
-.floating-toolbar[data-dock='bottom'] .tool-btn-wrapper.is-pinned .tool-hover-card {
-  transform: translateY(0);
+/* Goodnotes-Style Settings Row & Capsule Toggle Switch */
+.gn-settings-list {
+  gap: 4px;
 }
 
-.floating-toolbar[data-dock='left'] .tool-hover-card,
-.floating-toolbar[data-dock='right'] .tool-hover-card {
-  top: 0;
-  bottom: auto;
-  inset-inline: auto;
-  width: max-content;
-  max-width: min(70vw, 720px);
+.gn-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  text-align: start;
 }
 
-.floating-toolbar[data-dock='left'] .tool-hover-card {
-  left: calc(100% + 10px);
-  right: auto;
-  transform: translateX(4px);
+.gn-setting-row:hover {
+  background: var(--bg-surface-hover);
 }
 
-.floating-toolbar[data-dock='right'] .tool-hover-card {
-  right: calc(100% + 10px);
-  left: auto;
-  transform: translateX(-4px);
+.gn-setting-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
 }
 
-.floating-toolbar[data-dock='left'] .tool-btn-wrapper.is-pinned .tool-hover-card {
-  transform: translateX(0);
+.gn-setting-label svg {
+  color: var(--text-secondary);
+  flex-shrink: 0;
 }
 
-.floating-toolbar[data-dock='right'] .tool-btn-wrapper.is-pinned .tool-hover-card {
-  transform: translateX(0);
+.gn-switch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--bg-surface-active);
+  border: 1px solid var(--border-medium);
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+  flex-shrink: 0;
+}
+
+.gn-switch.is-on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.gn-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.gn-switch.is-on .gn-switch-thumb {
+  transform: translateX(16px);
+}
+
+/* Stamp Cards & Preview */
+.gn-stamp-preview-badge {
+  --stamp-hue: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: 2px solid var(--stamp-hue);
+  background: color-mix(in srgb, var(--stamp-hue) 12%, transparent);
+  color: var(--stamp-hue);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transform: rotate(-4deg);
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.gn-stamp-preview-badge[data-stamp-preview="APPROVED"],
+.gn-stamp-preview-badge[data-stamp-preview="PAID"],
+.gn-stamp-tile[data-stamp-variant="APPROVED"],
+.gn-stamp-tile[data-stamp-variant="PAID"] {
+  --stamp-hue: #10b981;
+}
+
+.gn-stamp-preview-badge[data-stamp-preview="CONFIDENTIAL"],
+.gn-stamp-preview-badge[data-stamp-preview="VOID"],
+.gn-stamp-tile[data-stamp-variant="CONFIDENTIAL"],
+.gn-stamp-tile[data-stamp-variant="VOID"] {
+  --stamp-hue: #ef4444;
+}
+
+.gn-stamp-preview-badge[data-stamp-preview="SIGN_HERE"],
+.gn-stamp-tile[data-stamp-variant="SIGN_HERE"] {
+  --stamp-hue: #f59e0b;
+}
+
+.gn-stamp-preview-badge[data-stamp-preview="DRAFT"],
+.gn-stamp-tile[data-stamp-variant="DRAFT"] {
+  --stamp-hue: #3b82f6;
+}
+
+.gn-stamp-tile {
+  --stamp-hue: var(--accent);
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1.5px solid color-mix(in srgb, var(--stamp-hue) 35%, var(--border-medium));
+  background: var(--bg-surface-elevated);
+  color: var(--stamp-hue);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.gn-stamp-tile:hover {
+  background: color-mix(in srgb, var(--stamp-hue) 12%, var(--bg-surface-hover));
+  color: var(--stamp-hue);
+}
+
+.gn-stamp-tile.active {
+  border-color: var(--stamp-hue);
+  background: color-mix(in srgb, var(--stamp-hue) 18%, transparent);
+  color: var(--stamp-hue);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--stamp-hue) 24%, transparent);
+}
+
+.gn-unit-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
 }
 
 .toolbar-group {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 3px;
 }
 
 .toolbar-separator {
   width: 1px;
-  height: 20px;
+  height: 22px;
   background: var(--border-subtle);
   margin: 0 4px;
 }
@@ -908,15 +1472,20 @@ body.no-page-shadows .pdf-page-container {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: calc(var(--control-h) + 2px);
-  height: calc(var(--control-h) + 2px);
-  border-radius: var(--radius-sm);
+  width: calc(var(--control-h) + 4px);
+  height: calc(var(--control-h) + 4px);
+  border-radius: 10px;
   background: transparent;
-  border: none;
+  border: 1px solid transparent;
   color: var(--text-secondary);
   cursor: pointer;
   transition: all var(--transition-fast);
   position: relative;
+}
+
+.tool-btn.has-popover {
+  padding-inline-end: 4px;
+  padding-bottom: 3px;
 }
 
 .tool-btn:hover {
@@ -925,9 +1494,10 @@ body.no-page-shadows .pdf-page-container {
 }
 
 .tool-btn.active {
-  background: var(--accent);
-  color: var(--accent-contrast);
-  box-shadow: 0 2px 8px var(--accent-glow);
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-surface-elevated));
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  color: var(--text-primary);
+  box-shadow: 0 2px 10px var(--accent-glow);
 }
 
 /* Document Scroll Area — the primary reading surface gets a wider,
@@ -1431,27 +2001,20 @@ html, body, .app-container {
   color: var(--text-secondary);
 }
 
-input.prop-num-input,
 input.prop-hex-input {
   background: var(--bg-surface-elevated);
   border: 1px solid var(--border-medium);
-  border-radius: 4px;
+  border-radius: 6px;
   outline: none;
-  padding: 1px 5px;
-  width: 64px;
-  text-align: right;
-}
-
-input.prop-hex-input {
-  text-align: left;
+  padding: 2px 6px;
+  text-align: center;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 400;
   color: var(--text-secondary);
-  width: 76px;
+  width: 74px;
 }
 
-input.prop-num-input:focus,
 input.prop-hex-input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-subtle);

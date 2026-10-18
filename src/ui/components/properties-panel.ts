@@ -1,6 +1,7 @@
 /**
  * Annotation Properties Inspector Panel
- * Allows adjusting colors, stroke widths, opacities, and alignment of selected annotations.
+ * Goodnotes-inspired visual inspector for adjusting colors, stroke widths,
+ * opacities, outline toggles, and alignment of selected annotations.
  */
 
 import { store } from '../../core/store';
@@ -21,6 +22,11 @@ function parseHexInput(raw: string): string | null {
     h = '#' + h.slice(1).split('').map(c => c + c).join('');
   }
   return /^#[0-9a-f]{6}$/.test(h) ? h : null;
+}
+
+function sliderPercent(val: number, min: number, max: number): number {
+  if (max <= min) return 0;
+  return Math.max(0, Math.min(100, ((val - min) / (max - min)) * 100));
 }
 
 export class PropertiesPanelComponent {
@@ -47,7 +53,6 @@ export class PropertiesPanelComponent {
     const doc = store.activeDocument;
     if (!doc) return;
 
-    // Find selected annotations
     const selectedAnnotations: Annotation[] = [];
     for (const [, list] of Object.entries(doc.annotations)) {
       for (const ann of list) {
@@ -63,9 +68,7 @@ export class PropertiesPanelComponent {
       return;
     }
 
-    // Never rebuild while the user is typing in a panel field: slider drags
-    // and keystrokes fire store notifies that would otherwise destroy the
-    // focused control mid-edit. Rebuild only when the selection itself changes.
+    // Never rebuild while the user is actively interacting with a slider or input
     const selectedKey = selectedIds.slice().sort().join(',');
     const activeEl = document.activeElement as HTMLElement | null;
     const userIsEditing = !!activeEl && this._container.contains(activeEl) &&
@@ -77,94 +80,160 @@ export class PropertiesPanelComponent {
     this._lastSelectedKey = selectedKey;
 
     const firstAnn = selectedAnnotations[0];
-    const hasShape = selectedAnnotations.some(ann => 'fillColor' in ann || ann.type === 'rectangle' || ann.type === 'ellipse' || ann.type === 'polygon' || ann.type === 'freeform-shape');
+    const hasShape = selectedAnnotations.some(ann =>
+      'fillColor' in ann || ann.type === 'rectangle' || ann.type === 'ellipse' ||
+      ann.type === 'polygon' || ann.type === 'freeform-shape'
+    );
     const firstFillColor = (firstAnn as any).fillColor || 'transparent';
     const hasOutlineToggle = selectedAnnotations.some(ann =>
       ann.type === 'rectangle' || ann.type === 'ellipse' ||
       ann.type === 'polygon' || ann.type === 'freeform-shape'
     );
     const firstOutline = (firstAnn as any).outline !== false;
+    const strokeCol = (firstAnn as any).color || (firstAnn as any).strokeColor || '#4f46e5';
+    const isTextAnn = 'fontSize' in firstAnn;
+    const widthVal = Number((firstAnn as any).strokeWidth || (firstAnn as any).fontSize || 3);
+    const widthMax = isTextAnn ? 120 : 60;
+    const opacityPct = Math.round((firstAnn.opacity ?? 1) * 100);
 
     this._container.innerHTML = `
       <div class="panel-header">
-        <span>${t('properties.title')} <span class="badge">${selectedAnnotations.length}</span></span>
+        <span>${t('properties.title')} <span class="badge is-accent">${selectedAnnotations.length}</span></span>
         <button id="close-props-btn" class="icon-btn" title="Clear selection" aria-label="Clear selection">
           ${getIconSvg('close', 14)}
         </button>
       </div>
 
       <div class="panel-body">
+        <!-- Live Preview Stage -->
+        <div class="gn-preview-stage" style="height:56px;">
+          <svg class="gn-preview-svg" viewBox="0 0 220 56" fill="none" aria-hidden="true">
+            <path id="prop-live-preview-path" d="M 24 38 C 76 62, 144 10, 196 32"
+                  stroke="${strokeCol}"
+                  stroke-opacity="${firstAnn.opacity ?? 1}"
+                  stroke-width="${Math.min(22, Math.max(1.8, widthVal * (isTextAnn ? 0.25 : 1)))}"
+                  stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </div>
+
         <!-- Stroke Color Picker -->
         <div class="prop-group">
-          <span class="prop-label">${hasShape ? 'Stroke Color' : t('properties.color')}</span>
+          <div class="prop-label-row">
+            <span class="prop-label">${hasShape ? 'Stroke Color' : t('properties.color')}</span>
+            <input type="text" class="prop-color-value prop-hex-input" id="prop-color-val"
+                   value="${strokeCol}"
+                   spellcheck="false" maxlength="7" title="Type any hex color" aria-label="Stroke color hex">
+          </div>
           <div class="prop-color-row">
             <div class="color-picker-wrapper is-lg" title="Color">
-              <input type="color" id="prop-color-picker" class="color-picker-input" value="${(firstAnn as any).color || (firstAnn as any).strokeColor || '#4f46e5'}">
+              <input type="color" id="prop-color-picker" class="color-picker-input" value="${strokeCol}">
             </div>
-            <input type="text" class="prop-color-value prop-hex-input" id="prop-color-val"
-                   value="${(firstAnn as any).color || (firstAnn as any).strokeColor || '#4f46e5'}"
-                   spellcheck="false" maxlength="7" title="Type any hex color" aria-label="Stroke color hex">
+            <div class="color-swatches-group" style="flex-wrap:wrap;">
+              ${['#000000', '#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6'].map(c => `
+                <button type="button" class="color-swatch ${strokeCol.toLowerCase() === c ? 'active' : ''}"
+                        style="background-color:${c};" data-prop-quick-color="${c}" title="${c}"></button>
+              `).join('')}
+            </div>
           </div>
         </div>
 
         <!-- Fill Color (if shape selected) -->
         ${hasShape ? `
           <div class="prop-group">
-            <span class="prop-label">Fill Color</span>
-            <div class="prop-color-row">
-              <button id="prop-no-fill-btn" class="secondary-btn is-compact ${firstFillColor === 'transparent' ? 'is-selected' : ''}">
-                No fill
-              </button>
-              <div class="color-picker-wrapper is-lg" title="Fill Color">
-                <input type="color" id="prop-fill-picker" class="color-picker-input" value="${firstFillColor === 'transparent' ? '#ffffff' : firstFillColor}">
-              </div>
+            <div class="prop-label-row">
+              <span class="prop-label">Fill Color</span>
               <input type="text" class="prop-color-value prop-hex-input" id="prop-fill-val"
                      value="${firstFillColor === 'transparent' ? '' : firstFillColor}"
                      placeholder="None" spellcheck="false" maxlength="7"
                      title="Type any hex fill color, empty = none" aria-label="Fill color hex">
             </div>
-          </div>
-        ` : ''}
-
-        <!-- Outline Toggle -->
-        ${hasOutlineToggle ? `
-          <div class="prop-group">
-            <span class="prop-label">Outline</span>
-            <div class="prop-btn-row">
-              <button class="secondary-btn ${firstOutline ? 'is-selected' : ''}" data-prop-outline="on">On</button>
-              <button class="secondary-btn ${firstOutline ? '' : 'is-selected'}" data-prop-outline="off">Off</button>
+            <div class="prop-color-row">
+              <button id="prop-no-fill-btn" class="color-swatch gn-nofill-swatch ${firstFillColor === 'transparent' ? 'active' : ''}" title="No Fill">
+                ${getIconSvg('noFill', 14)}
+              </button>
+              <div class="color-picker-wrapper is-lg" title="Fill Color">
+                <input type="color" id="prop-fill-picker" class="color-picker-input" value="${firstFillColor === 'transparent' ? '#ffffff' : firstFillColor}">
+              </div>
+              <div class="color-swatches-group" style="flex-wrap:wrap;">
+                ${['#ef4444', '#3b82f6', '#10b981', '#fef08a', '#f59e0b'].map(c => `
+                  <button type="button" class="color-swatch ${firstFillColor.toLowerCase() === c ? 'active' : ''}"
+                          style="background-color:${c};" data-prop-quick-fill="${c}" title="${c}"></button>
+                `).join('')}
+              </div>
             </div>
           </div>
         ` : ''}
 
-        <!-- Stroke Width / Font Size -->
+        <!-- Stroke Width / Font Size Slider + Input -->
         <div class="prop-group">
           <div class="prop-label-row">
-            <span class="prop-label">${'fontSize' in firstAnn ? 'Font Size' : t('properties.strokeWidth')}</span>
-            <input type="number" class="prop-value prop-num-input" id="prop-width-val"
-                   min="0.5" max="120" step="0.5" value="${(firstAnn as any).strokeWidth || (firstAnn as any).fontSize || 3}"
-                   title="Type any size" aria-label="${t('properties.strokeWidth')}">
+            <span class="prop-label">${isTextAnn ? 'Font Size' : t('properties.strokeWidth')}</span>
+            <div class="gn-num-badge">
+              <input type="number" class="prop-value prop-num-input" id="prop-width-val"
+                     min="0.5" max="120" step="0.5" value="${widthVal}"
+                     title="Type any size" aria-label="${t('properties.strokeWidth')}">
+              <span class="gn-unit">px</span>
+            </div>
+          </div>
+          <div class="gn-slider-wrap">
+            <input type="range" id="prop-width-slider" class="gn-range-slider"
+                   min="0.5" max="${widthMax}" step="0.5" value="${Math.min(widthMax, widthVal)}"
+                   style="--slider-pct:${sliderPercent(Math.min(widthMax, widthVal), 0.5, widthMax)}%"
+                   aria-label="Width slider">
           </div>
         </div>
 
-        <!-- Opacity -->
+        <!-- Opacity Slider + Input -->
         <div class="prop-group">
           <div class="prop-label-row">
             <span class="prop-label">${t('properties.opacity')}</span>
-            <input type="number" class="prop-value prop-num-input" id="prop-opacity-val"
-                   min="1" max="100" step="1" value="${Math.round((firstAnn.opacity || 1) * 100)}"
-                   title="Type any opacity (1-100%)" aria-label="${t('properties.opacity')}">
+            <div class="gn-num-badge">
+              <input type="number" class="prop-value prop-num-input" id="prop-opacity-val"
+                     min="1" max="100" step="1" value="${opacityPct}"
+                     title="Type any opacity (1-100%)" aria-label="${t('properties.opacity')}">
+              <span class="gn-unit">%</span>
+            </div>
+          </div>
+          <div class="gn-slider-wrap gn-slider-notched">
+            <input type="range" id="prop-opacity-slider" class="gn-range-slider"
+                   min="5" max="100" step="1" value="${opacityPct}"
+                   style="--slider-pct:${sliderPercent(opacityPct, 5, 100)}%"
+                   aria-label="Opacity slider">
           </div>
         </div>
+
+        <!-- Outline Switch -->
+        ${hasOutlineToggle ? `
+          <div class="prop-group">
+            <button type="button" class="gn-setting-row" id="prop-outline-switch" aria-pressed="${firstOutline}">
+              <span class="gn-setting-label">
+                ${getIconSvg('outlineOn', 15)}
+                <span>Shape Border (Outline)</span>
+              </span>
+              <span class="gn-switch ${firstOutline ? 'is-on' : ''}">
+                <span class="gn-switch-thumb"></span>
+              </span>
+            </button>
+          </div>
+        ` : ''}
 
         <!-- Alignment (if multi-select) -->
         ${selectedAnnotations.length > 1 ? `
           <div class="prop-group">
             <span class="prop-label">Alignment</span>
-            <div class="prop-btn-row">
-              <button class="secondary-btn" data-align="left">Left</button>
-              <button class="secondary-btn" data-align="center">Center</button>
-              <button class="secondary-btn" data-align="right">Right</button>
+            <div class="gn-tile-grid cols-3">
+              <button type="button" class="gn-icon-tile is-compact" data-align="left" title="Align Left">
+                <span class="gn-tile-icon">${getIconSvg('alignLeft', 18)}</span>
+                <span class="gn-tile-label">Left</span>
+              </button>
+              <button type="button" class="gn-icon-tile is-compact" data-align="center" title="Align Center">
+                <span class="gn-tile-icon">${getIconSvg('alignCenter', 18)}</span>
+                <span class="gn-tile-label">Center</span>
+              </button>
+              <button type="button" class="gn-icon-tile is-compact" data-align="right" title="Align Right">
+                <span class="gn-tile-icon">${getIconSvg('alignRight', 18)}</span>
+                <span class="gn-tile-label">Right</span>
+              </button>
             </div>
           </div>
         ` : ''}
@@ -182,12 +251,36 @@ export class PropertiesPanelComponent {
       store.clearSelection();
     });
 
+    this._container.querySelectorAll<HTMLElement>('.gn-num-badge').forEach(badge => {
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const inp = badge.querySelector<HTMLInputElement>('input');
+        if (inp && document.activeElement !== inp) {
+          inp.focus();
+          inp.select();
+        }
+      });
+    });
+
     const syncHexInput = (selector: string, val: string) => {
       const el = this._container.querySelector<HTMLInputElement>(selector);
       if (el && document.activeElement !== el && el.value !== val) el.value = val;
     };
 
+    const updateLivePreview = (color?: string, width?: number, opacity?: number) => {
+      const path = this._container.querySelector<SVGPathElement>('#prop-live-preview-path');
+      if (!path) return;
+      if (color) path.setAttribute('stroke', color);
+      if (width !== undefined) {
+        path.setAttribute('stroke-width', String(Math.min(22, Math.max(1.8, width * (isTextAnn ? 0.25 : 1)))));
+      }
+      if (opacity !== undefined) {
+        path.setAttribute('stroke-opacity', String(opacity));
+      }
+    };
+
     const applyStrokeColor = (val: string) => {
+      updateLivePreview(val);
       selectedAnnotations.forEach(ann => {
         const prev = { ...ann };
         const next = { ...ann };
@@ -198,7 +291,6 @@ export class PropertiesPanelComponent {
       store.setActivePageIndex(store.activePageIndex);
     };
 
-    // Color picker change
     const colorPicker = this._container.querySelector('#prop-color-picker') as HTMLInputElement;
     colorPicker?.addEventListener('input', () => {
       const val = colorPicker.value;
@@ -206,7 +298,17 @@ export class PropertiesPanelComponent {
       applyStrokeColor(val);
     });
 
-    // Typed hex stroke color (Enter/blur commits, Escape reverts)
+    this._container.querySelectorAll('[data-prop-quick-color]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const val = btn.getAttribute('data-prop-quick-color');
+        if (val) {
+          syncHexInput('#prop-color-val', val);
+          if (colorPicker) colorPicker.value = val;
+          applyStrokeColor(val);
+        }
+      });
+    });
+
     const colorHex = this._container.querySelector<HTMLInputElement>('#prop-color-val');
     const commitColorHex = () => {
       if (!colorHex) return;
@@ -232,7 +334,7 @@ export class PropertiesPanelComponent {
     const onFillChange = (val: string) => {
       syncHexInput('#prop-fill-val', val === 'transparent' ? '' : val);
       const noFillBtn = this._container.querySelector('#prop-no-fill-btn');
-      noFillBtn?.classList.toggle('is-selected', val === 'transparent');
+      noFillBtn?.classList.toggle('active', val === 'transparent');
 
       selectedAnnotations.forEach(ann => {
         if ('fillColor' in ann) {
@@ -244,7 +346,6 @@ export class PropertiesPanelComponent {
       store.setActivePageIndex(store.activePageIndex);
     };
 
-    // Typed hex fill color (empty = none)
     const fillHex = this._container.querySelector<HTMLInputElement>('#prop-fill-val');
     const commitFillHex = () => {
       if (!fillHex) return;
@@ -273,11 +374,22 @@ export class PropertiesPanelComponent {
     fillPicker?.addEventListener('input', () => onFillChange(fillPicker.value));
     fillPicker?.addEventListener('change', () => onFillChange(fillPicker.value));
 
+    this._container.querySelectorAll('[data-prop-quick-fill]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const val = btn.getAttribute('data-prop-quick-fill');
+        if (val) {
+          if (fillPicker) fillPicker.value = val;
+          onFillChange(val);
+        }
+      });
+    });
+
     this._container.querySelector('#prop-no-fill-btn')?.addEventListener('click', () => {
       onFillChange('transparent');
     });
 
     const applyStrokeWidth = (val: number) => {
+      updateLivePreview(undefined, val);
       selectedAnnotations.forEach(ann => {
         if ('strokeWidth' in ann) {
           const prev = { ...ann };
@@ -312,6 +424,7 @@ export class PropertiesPanelComponent {
     };
 
     const applyOpacity = (val: number) => {
+      updateLivePreview(undefined, undefined, val);
       selectedAnnotations.forEach(ann => {
         const prev = { ...ann };
         const next = { ...ann, opacity: val };
@@ -323,14 +436,26 @@ export class PropertiesPanelComponent {
       store.setActivePageIndex(store.activePageIndex);
     };
 
-    // Typed width (Enter/blur commits)
+    // Width slider & input sync
     const widthNum = this._container.querySelector<HTMLInputElement>('#prop-width-val');
+    const widthSlider = this._container.querySelector<HTMLInputElement>('#prop-width-slider');
+    widthSlider?.addEventListener('input', () => {
+      const val = parseFloat(widthSlider.value || '3');
+      widthSlider.style.setProperty('--slider-pct', `${sliderPercent(val, 0.5, widthMax)}%`);
+      if (widthNum) widthNum.value = String(val);
+      applyStrokeWidth(val);
+    });
+
     const commitWidthNum = () => {
       if (!widthNum) return;
       const fallback = Number((firstAnn as any).strokeWidth || (firstAnn as any).fontSize) || 3;
       const n = parseFloat(widthNum.value);
       const val = Number.isFinite(n) ? Math.min(120, Math.max(0.5, n)) : fallback;
       widthNum.value = String(val);
+      if (widthSlider) {
+        widthSlider.value = String(Math.min(widthMax, val));
+        widthSlider.style.setProperty('--slider-pct', `${sliderPercent(Math.min(widthMax, val), 0.5, widthMax)}%`);
+      }
       applyStrokeWidth(val);
     };
     widthNum?.addEventListener('keydown', (e) => {
@@ -342,14 +467,26 @@ export class PropertiesPanelComponent {
     widthNum?.addEventListener('change', () => commitWidthNum());
     widthNum?.addEventListener('blur', () => commitWidthNum());
 
-    // Typed opacity (Enter/blur commits)
+    // Opacity slider & input sync
     const opacityNum = this._container.querySelector<HTMLInputElement>('#prop-opacity-val');
+    const opacitySlider = this._container.querySelector<HTMLInputElement>('#prop-opacity-slider');
+    opacitySlider?.addEventListener('input', () => {
+      const pct = Math.round(parseFloat(opacitySlider.value || '100'));
+      opacitySlider.style.setProperty('--slider-pct', `${sliderPercent(pct, 5, 100)}%`);
+      if (opacityNum) opacityNum.value = String(pct);
+      applyOpacity(pct / 100);
+    });
+
     const commitOpacityNum = () => {
       if (!opacityNum) return;
       const fallback = Math.round((firstAnn.opacity || 1) * 100);
       const n = parseFloat(opacityNum.value);
       const pct = Number.isFinite(n) ? Math.min(100, Math.max(1, Math.round(n))) : fallback;
       opacityNum.value = String(pct);
+      if (opacitySlider) {
+        opacitySlider.value = String(Math.max(5, pct));
+        opacitySlider.style.setProperty('--slider-pct', `${sliderPercent(Math.max(5, pct), 5, 100)}%`);
+      }
       applyOpacity(pct / 100);
     };
     opacityNum?.addEventListener('keydown', (e) => {
@@ -361,20 +498,22 @@ export class PropertiesPanelComponent {
     opacityNum?.addEventListener('change', () => commitOpacityNum());
     opacityNum?.addEventListener('blur', () => commitOpacityNum());
 
-    // Outline toggle
-    this._container.querySelectorAll('[data-prop-outline]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const on = btn.getAttribute('data-prop-outline') === 'on';
-        selectedAnnotations.forEach(ann => {
-          if (ann.type === 'rectangle' || ann.type === 'ellipse' || ann.type === 'polygon' ||
-              ann.type === 'freeform-shape') {
-            const prev = { ...ann };
-            const next = { ...ann, outline: on };
-            history.execute(new ModifyAnnotationCommand(ann.pageIndex, prev, next));
-          }
-        });
-        store.setActivePageIndex(store.activePageIndex);
+    // Outline switch
+    const outlineSwitch = this._container.querySelector<HTMLElement>('#prop-outline-switch');
+    outlineSwitch?.addEventListener('click', () => {
+      const currentlyOn = outlineSwitch.getAttribute('aria-pressed') === 'true';
+      const nextOn = !currentlyOn;
+      outlineSwitch.setAttribute('aria-pressed', String(nextOn));
+      outlineSwitch.querySelector('.gn-switch')?.classList.toggle('is-on', nextOn);
+      selectedAnnotations.forEach(ann => {
+        if (ann.type === 'rectangle' || ann.type === 'ellipse' || ann.type === 'polygon' ||
+            ann.type === 'freeform-shape') {
+          const prev = { ...ann };
+          const next = { ...ann, outline: nextOn };
+          history.execute(new ModifyAnnotationCommand(ann.pageIndex, prev, next));
+        }
       });
+      store.setActivePageIndex(store.activePageIndex);
     });
 
     // Delete button

@@ -38,3 +38,22 @@
 [dir="rtl"] .header-left {
   flex-direction: row-reverse;
 }
+
+[dir="rtl"] .gn-switch-thumb {
+  left: auto;
+  right: 2px;
+}
+
+[dir="rtl"] .gn-switch.is-on .gn-switch-thumb {
+  transform: translateX(-16px);
+}
+
+[dir="rtl"] .gn-range-slider {
+  background: linear-gradient(
+    to left,
+    var(--accent) 0%,
+    var(--accent) var(--slider-pct),
+    var(--bg-surface-active) var(--slider-pct),
+    var(--bg-surface-active) 100%
+  );
+}
