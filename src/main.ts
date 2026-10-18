@@ -97,6 +97,11 @@ class VeditorApp {
 
   private _zoomCommitTimer: number | null = null;
   private _chunkUpdateTimer: number | null = null;
+  private _fastScrollTimer: number | null = null;
+  private _isFastScrolling: boolean = false;
+  private _lastScrollTop: number = 0;
+  private _lastScrollLeft: number = 0;
+  private _lastScrollTime: number = 0;
   private _previewRafId: number | null = null;
   private _previewPendingFactor: number = 1;
   private _previewPendingCenter: { x: number; y: number } | null = null;
@@ -301,7 +306,8 @@ class VeditorApp {
           await this.loadPDF(session.name, session.fileData, docId, session.notebook, {
             activePageIndex: session.activePageIndex || 0,
             savedScrollTop: session.savedScrollTop,
-            savedScrollLeft: session.savedScrollLeft
+            savedScrollLeft: session.savedScrollLeft,
+            annotations: session.annotations
           });
         }
       }
@@ -365,7 +371,8 @@ class VeditorApp {
           await this.loadPDF(session.name, session.fileData, docId, session.notebook, {
             activePageIndex: session.activePageIndex || 0,
             savedScrollTop: session.savedScrollTop,
-            savedScrollLeft: session.savedScrollLeft
+            savedScrollLeft: session.savedScrollLeft,
+            annotations: session.annotations
           });
         }
       }
@@ -440,7 +447,8 @@ class VeditorApp {
       existing ? {
         activePageIndex: existing.activePageIndex || 0,
         savedScrollTop: existing.savedScrollTop,
-        savedScrollLeft: existing.savedScrollLeft
+        savedScrollLeft: existing.savedScrollLeft,
+        annotations: existing.annotations
       } : undefined,
       path
     );
@@ -519,7 +527,12 @@ class VeditorApp {
     bytes: Uint8Array,
     existingDocId?: string,
     notebook?: NotebookSpec,
-    initialState?: { activePageIndex?: number; savedScrollTop?: number; savedScrollLeft?: number },
+    initialState?: {
+      activePageIndex?: number;
+      savedScrollTop?: number;
+      savedScrollLeft?: number;
+      annotations?: DocumentSession['annotations'];
+    },
     nativeFilePath?: string
   ): Promise<string | null> {
     this.showPdfLoading(name, 'Opening document…');
@@ -538,14 +551,19 @@ class VeditorApp {
       const { pageCount, pages, bookmarks } = await pdfEngine.loadFromBytes(masterBytes, docId);
 
       const existingSession = existingDocId ? store.openDocuments.get(existingDocId) : null;
-      const importedAnnotations: DocumentSession['annotations'] = existingSession?.annotations
-        ? { ...existingSession.annotations }
+      const baseAnnotations = existingSession?.annotations || initialState?.annotations;
+      const importedAnnotations: DocumentSession['annotations'] = baseAnnotations
+        ? { ...baseAnnotations }
         : {};
 
-      for (const { pageIndex, annotation } of await pdfEngine.extractNativeAnnotations(masterBytes)) {
-        const list = (importedAnnotations[pageIndex] ??= []);
-        if (!list.some(a => a.id === annotation.id)) {
-          list.push(annotation);
+      // Only parse native annotations on brand-new document opens, never when
+      // restoring an existing session whose annotations are already persisted.
+      if (!baseAnnotations) {
+        for (const { pageIndex, annotation } of await pdfEngine.extractNativeAnnotations(masterBytes)) {
+          const list = (importedAnnotations[pageIndex] ??= []);
+          if (!list.some(a => a.id === annotation.id)) {
+            list.push(annotation);
+          }
         }
       }
 
@@ -617,17 +635,17 @@ class VeditorApp {
   private clearRenderedPages() {
     for (const [pageIndex, p] of this._renderedPages) {
       pdfEngine.cancelPageRender(pageIndex);
-      p.pdfCanvas.width = 1; p.pdfCanvas.height = 1;
+      p.pdfCanvas.width = 0; p.pdfCanvas.height = 0;
       if (p.chunkCanvas) {
-        p.chunkCanvas.width = 1; p.chunkCanvas.height = 1;
+        p.chunkCanvas.width = 0; p.chunkCanvas.height = 0;
       }
-      p.annotCanvas.width = 1; p.annotCanvas.height = 1;
+      p.annotCanvas.width = 0; p.annotCanvas.height = 0;
       if (p.annotChunkCanvas) {
-        p.annotChunkCanvas.width = 1; p.annotChunkCanvas.height = 1;
+        p.annotChunkCanvas.width = 0; p.annotChunkCanvas.height = 0;
       }
-      p.scratchCanvas.width = 1; p.scratchCanvas.height = 1;
+      p.scratchCanvas.width = 0; p.scratchCanvas.height = 0;
       if (p.scratchChunkCanvas) {
-        p.scratchChunkCanvas.width = 1; p.scratchChunkCanvas.height = 1;
+        p.scratchChunkCanvas.width = 0; p.scratchChunkCanvas.height = 0;
       }
       if (p.container.parentNode === this._pagesWrapper) {
         this._pagesWrapper.removeChild(p.container);
@@ -884,6 +902,11 @@ class VeditorApp {
       window.clearTimeout(this._chunkUpdateTimer);
       this._chunkUpdateTimer = null;
     }
+    if (this._fastScrollTimer !== null) {
+      window.clearTimeout(this._fastScrollTimer);
+      this._fastScrollTimer = null;
+    }
+    this._isFastScrolling = false;
     if (this._previewRafId !== null) {
       window.cancelAnimationFrame(this._previewRafId);
       this._previewRafId = null;
@@ -920,55 +943,120 @@ class VeditorApp {
     viewportManager.handleScroll(true);
   }
 
-  private scheduleChunkUpdate(delayMs: number = 75): void {
+  private scheduleChunkUpdate(delayMs: number = 85): void {
     if (this._chunkUpdateTimer !== null) {
       window.clearTimeout(this._chunkUpdateTimer);
     }
     this._chunkUpdateTimer = window.setTimeout(() => {
       this._chunkUpdateTimer = null;
-      this.updateVisiblePageChunks(true);
+      this.updateVisiblePageChunks(true, false);
     }, delayMs);
   }
 
   /**
-   * Computes the exact intersection of a mounted page container with the scroll
-   * container's visible viewport (padded by 128 CSS px) using live screen
-   * bounding rects. Immune to RTL scrollLeft sign inversions and margin offsets.
+   * Returns true if the given chunk canvas already covers the currently visible
+   * viewport portion of `container` with at least `marginPx` safety margin.
+   * Prevents redundant chunk shifts and repaints on small scroll increments.
+   */
+  private doesChunkCoverViewport(
+    chunk: HTMLCanvasElement | undefined,
+    container: HTMLElement,
+    layout: { width: number; height: number },
+    marginPx: number = 48
+  ): boolean {
+    if (!chunk || chunk.style.display !== 'block' || chunk.width <= 1 || chunk.height <= 1) return false;
+    if (!this._scrollContainer) return false;
+    const baseZoom = parseFloat(chunk.dataset.baseZoom || '0');
+    if (Math.abs(baseZoom - store.zoom) > 0.0005) return false;
+
+    const cx = parseFloat(chunk.dataset.baseLeft || '0');
+    const cy = parseFloat(chunk.dataset.baseTop || '0');
+    const cw = parseFloat(chunk.dataset.baseWidth || '0');
+    const ch = parseFloat(chunk.dataset.baseHeight || '0');
+    if (cw <= 8 || ch <= 8) return false;
+
+    const scrollRect = this._scrollContainer.getBoundingClientRect();
+    const pageRect = container.getBoundingClientRect();
+    if (scrollRect.width <= 0 || scrollRect.height <= 0 || pageRect.width <= 0 || pageRect.height <= 0) {
+      return false;
+    }
+
+    const visX0 = Math.max(0, scrollRect.left - pageRect.left);
+    const visY0 = Math.max(0, scrollRect.top - pageRect.top);
+    const visX1 = Math.min(layout.width, scrollRect.right - pageRect.left);
+    const visY1 = Math.min(layout.height, scrollRect.bottom - pageRect.top);
+    if (visX1 <= visX0 || visY1 <= visY0) return false;
+
+    const reqX0 = Math.max(0, visX0 - marginPx);
+    const reqY0 = Math.max(0, visY0 - marginPx);
+    const reqX1 = Math.min(layout.width, visX1 + marginPx);
+    const reqY1 = Math.min(layout.height, visY1 + marginPx);
+
+    return (
+      cx <= reqX0 + 2 &&
+      cy <= reqY0 + 2 &&
+      cx + cw >= reqX1 - 2 &&
+      cy + ch >= reqY1 - 2
+    );
+  }
+
+  /**
+   * Computes a CONSTANT-SIZE viewport chunk rectangle (padded by 192 CSS px)
+   * for a visible page container. Keeping `width` and `height` constant across
+   * the entire page while scrolling ensures the canvas backing store (`width`,
+   * `height`) is allocated ONCE and never reallocated as the user scrolls near
+   * the top or bottom edge of a page.
    */
   private computePageViewportChunkRect(
     container: HTMLElement,
     layout: { top: number; left: number; width: number; height: number }
   ): { x: number; y: number; width: number; height: number } | null {
     if (!this._scrollContainer) return null;
-    const pad = 128;
+    const pad = 192;
+    const pageW = Math.max(1, Math.ceil(layout.width));
+    const pageH = Math.max(1, Math.ceil(layout.height));
     const scrollRect = this._scrollContainer.getBoundingClientRect();
     const pageRect = container.getBoundingClientRect();
 
-    let ix0: number;
-    let iy0: number;
-    let ix1: number;
-    let iy1: number;
+    let viewW: number;
+    let viewH: number;
+    let relLeft: number;
+    let relTop: number;
 
     if (scrollRect.width > 0 && scrollRect.height > 0 && pageRect.width > 0 && pageRect.height > 0) {
-      ix0 = Math.max(0, Math.floor(scrollRect.left - pageRect.left - pad));
-      iy0 = Math.max(0, Math.floor(scrollRect.top - pageRect.top - pad));
-      ix1 = Math.min(layout.width, Math.ceil(scrollRect.right - pageRect.left + pad));
-      iy1 = Math.min(layout.height, Math.ceil(scrollRect.bottom - pageRect.top + pad));
+      viewW = scrollRect.width;
+      viewH = scrollRect.height;
+      relLeft = scrollRect.left - pageRect.left;
+      relTop = scrollRect.top - pageRect.top;
     } else {
-      const viewLeft = this._scrollContainer.scrollLeft;
-      const viewTop = this._scrollContainer.scrollTop;
-      const viewW = this._scrollContainer.clientWidth;
-      const viewH = this._scrollContainer.clientHeight;
+      viewW = this._scrollContainer.clientWidth;
+      viewH = this._scrollContainer.clientHeight;
       if (viewW <= 0 || viewH <= 0) return null;
-      ix0 = Math.max(0, Math.floor(viewLeft - pad - layout.left));
-      iy0 = Math.max(0, Math.floor(viewTop - pad - layout.top));
-      ix1 = Math.min(layout.width, Math.ceil(viewLeft + viewW + pad - layout.left));
-      iy1 = Math.min(layout.height, Math.ceil(viewTop + viewH + pad - layout.top));
+      relLeft = this._scrollContainer.scrollLeft - layout.left;
+      relTop = this._scrollContainer.scrollTop - layout.top;
     }
 
-    const cw = ix1 - ix0;
-    const ch = iy1 - iy0;
+    // First verify the page actually intersects the visible viewport
+    const visX0 = Math.max(0, relLeft);
+    const visY0 = Math.max(0, relTop);
+    const visX1 = Math.min(pageW, relLeft + viewW);
+    const visY1 = Math.min(pageH, relTop + viewH);
+    if (visX1 - visX0 <= 4 || visY1 - visY0 <= 4) {
+      return null;
+    }
+
+    // Constant window dimensions independent of scroll offset
+    const cw = Math.min(pageW, Math.ceil(viewW + pad * 2));
+    const ch = Math.min(pageH, Math.ceil(viewH + pad * 2));
     if (cw <= 8 || ch <= 8) return null;
+
+    const maxX = Math.max(0, pageW - cw);
+    const maxY = Math.max(0, pageH - ch);
+    const rawX = Math.round((relLeft - pad) / 16) * 16;
+    const rawY = Math.round((relTop - pad) / 16) * 16;
+    const ix0 = Math.max(0, Math.min(maxX, rawX));
+    const iy0 = Math.max(0, Math.min(maxY, rawY));
+
     return { x: ix0, y: iy0, width: cw, height: ch };
   }
 
@@ -978,7 +1066,7 @@ class VeditorApp {
    * exact intersection of the page with the scroll container's viewport and
    * renders ONLY that visible rectangle at 100% native DPI.
    */
-  private updateVisiblePageChunks(renderPdfRaster: boolean = true): void {
+  private updateVisiblePageChunks(renderPdfRaster: boolean = true, forceUpdate: boolean = false): void {
     if (this._isZoomGestureActive || store.isDocSwitching || store.isZoomAdjusting) return;
     const doc = store.activeDocument;
     if (!doc || !this._scrollContainer) return;
@@ -997,28 +1085,30 @@ class VeditorApp {
         pdfEngine.cancelPageChunkRender(pageIndex);
         if (chunkCanvas.style.display !== 'none') {
           chunkCanvas.style.display = 'none';
-          chunkCanvas.width = 1;
-          chunkCanvas.height = 1;
+          chunkCanvas.width = 0;
+          chunkCanvas.height = 0;
           delete chunkCanvas.dataset.chunkKey;
         }
         if (p.annotChunkCanvas && p.annotChunkCanvas.style.display !== 'none') {
           p.annotChunkCanvas.style.display = 'none';
-          p.annotChunkCanvas.width = 1;
-          p.annotChunkCanvas.height = 1;
+          p.annotChunkCanvas.width = 0;
+          p.annotChunkCanvas.height = 0;
           delete p.annotChunkCanvas.dataset.annotKey;
         }
         if (p.scratchChunkCanvas && p.scratchChunkCanvas.style.display !== 'none') {
           p.scratchChunkCanvas.style.display = 'none';
-          p.scratchChunkCanvas.width = 1;
-          p.scratchChunkCanvas.height = 1;
+          p.scratchChunkCanvas.width = 0;
+          p.scratchChunkCanvas.height = 0;
         }
-        if (layout) {
+        if (layout && !this._isFastScrolling) {
           const dpr = resolveAdaptiveCanvasDpr(layout.width, layout.height, store.appSettings.targetDPI);
           const w = Math.max(1, Math.round(layout.width * dpr));
           const h = Math.max(1, Math.round(layout.height * dpr));
           if (p.annotCanvas.width !== w || p.annotCanvas.height !== h || p.annotCanvas.style.opacity !== '') {
-            p.annotCanvas.width = w;
-            p.annotCanvas.height = h;
+            if (p.annotCanvas.width !== w || p.annotCanvas.height !== h) {
+              p.annotCanvas.width = w;
+              p.annotCanvas.height = h;
+            }
             p.annotCanvas.style.opacity = '';
             this.repaintPageAnnotations(pageIndex, p);
           }
@@ -1033,27 +1123,38 @@ class VeditorApp {
         pdfEngine.cancelPageChunkRender(pageIndex);
         if (chunkCanvas.style.display !== 'none') {
           chunkCanvas.style.display = 'none';
-          chunkCanvas.width = 1;
-          chunkCanvas.height = 1;
+          chunkCanvas.width = 0;
+          chunkCanvas.height = 0;
           delete chunkCanvas.dataset.chunkKey;
         }
         if (p.annotChunkCanvas && p.annotChunkCanvas.style.display !== 'none') {
           p.annotChunkCanvas.style.display = 'none';
-          p.annotChunkCanvas.width = 1;
-          p.annotChunkCanvas.height = 1;
+          p.annotChunkCanvas.width = 0;
+          p.annotChunkCanvas.height = 0;
           delete p.annotChunkCanvas.dataset.annotKey;
         }
         if (p.scratchChunkCanvas && p.scratchChunkCanvas.style.display !== 'none') {
           p.scratchChunkCanvas.style.display = 'none';
-          p.scratchChunkCanvas.width = 1;
-          p.scratchChunkCanvas.height = 1;
+          p.scratchChunkCanvas.width = 0;
+          p.scratchChunkCanvas.height = 0;
         }
         continue;
       }
 
-      this.updateAnnotationChunkGeometry(pageIndex, p, chunkRect, false);
+      if (this._isFastScrolling && !forceUpdate) {
+        continue;
+      }
+
+      const annotCovered = !forceUpdate && this.doesChunkCoverViewport(p.annotChunkCanvas, p.container, layout, 48);
+      if (!annotCovered) {
+        this.updateAnnotationChunkGeometry(pageIndex, p, chunkRect, false);
+      }
+
       if (renderPdfRaster) {
-        void pdfEngine.renderPageChunkToCanvas(pageIndex, chunkCanvas, store.zoom, rot, chunkRect);
+        const pdfCovered = !forceUpdate && this.doesChunkCoverViewport(chunkCanvas, p.container, layout, 48);
+        if (!pdfCovered) {
+          void pdfEngine.renderPageChunkToCanvas(pageIndex, chunkCanvas, store.zoom, rot, chunkRect);
+        }
       }
     }
   }
@@ -1111,28 +1212,31 @@ class VeditorApp {
           scratchChunk.width = pw;
           scratchChunk.height = ph;
         }
-      } else if (scratchChunk.width !== 1 || scratchChunk.height !== 1) {
-        scratchChunk.width = 1;
-        scratchChunk.height = 1;
+      } else if (scratchChunk.width > 1 || scratchChunk.height > 1) {
+        scratchChunk.width = 0;
+        scratchChunk.height = 0;
       }
-      if (p.scratchCanvas.width !== 1 || p.scratchCanvas.height !== 1) {
-        p.scratchCanvas.width = 1;
-        p.scratchCanvas.height = 1;
+      if (p.scratchCanvas.width > 1 || p.scratchCanvas.height > 1) {
+        p.scratchCanvas.width = 0;
+        p.scratchCanvas.height = 0;
       }
     }
 
     // Collapse the hidden full-page annotation canvas underneath so it uses 0 VRAM
     // at high zoom and never double-composites translucent highlighters.
     p.annotCanvas.style.opacity = '0';
-    if (p.annotCanvas.width !== 1 || p.annotCanvas.height !== 1) {
-      p.annotCanvas.width = 1;
-      p.annotCanvas.height = 1;
+    if (p.annotCanvas.width > 1 || p.annotCanvas.height > 1) {
+      p.annotCanvas.width = 0;
+      p.annotCanvas.height = 0;
     }
 
     const annotKey = `${store.zoom.toFixed(4)}|${chunkRect.x},${chunkRect.y},${pw},${ph}`;
-    if (annotChunk.width !== pw || annotChunk.height !== ph || annotChunk.dataset.annotKey !== annotKey) {
+    const sizeChanged = annotChunk.width !== pw || annotChunk.height !== ph;
+    if (sizeChanged) {
       annotChunk.width = pw;
       annotChunk.height = ph;
+    }
+    if (sizeChanged || annotChunk.dataset.annotKey !== annotKey) {
       annotChunk.dataset.annotKey = annotKey;
       this.repaintAnnotationChunk(pageIndex, p);
     }
@@ -1283,12 +1387,37 @@ class VeditorApp {
     }, { passive: false });
 
     // Refresh High-DPI Viewport Chunk when panning/scrolling at high zoom:
-    // vector annotations & scratchpad chunk geometry update immediately (0ms lag)
-    // while the async PDF.js raster chunk updates after a brief 75ms settle.
+    // deadzone hysteresis avoids reallocating or repainting chunks while the
+    // visible screen stays inside the padded chunk window, and fast-scroll
+    // detection pauses heavy rasterization for intermediate pages flying by.
     this._scrollContainer.addEventListener('scroll', () => {
       if (!this._isZoomGestureActive && store.activeDocument) {
-        this.updateVisiblePageChunks(false);
-        this.scheduleChunkUpdate(75);
+        const now = performance.now();
+        const st = this._scrollContainer.scrollTop;
+        const sl = this._scrollContainer.scrollLeft;
+        const dt = Math.max(1, now - this._lastScrollTime);
+        const dist = Math.abs(st - this._lastScrollTop) + Math.abs(sl - this._lastScrollLeft);
+        this._lastScrollTop = st;
+        this._lastScrollLeft = sl;
+        this._lastScrollTime = now;
+
+        if (dist > 110 || (dt < 80 && dist / dt > 2.2)) {
+          this._isFastScrolling = true;
+          if (this._fastScrollTimer !== null) {
+            window.clearTimeout(this._fastScrollTimer);
+          }
+          this._fastScrollTimer = window.setTimeout(() => {
+            this._fastScrollTimer = null;
+            this._isFastScrolling = false;
+            if (store.activeDocument && !store.isDocSwitching) {
+              viewportManager.handleScroll(true);
+              this.updateVisiblePageChunks(true, false);
+            }
+          }, 110);
+        } else if (!this._isFastScrolling) {
+          this.updateVisiblePageChunks(false, false);
+          this.scheduleChunkUpdate(85);
+        }
       }
     }, { passive: true });
 
@@ -1336,8 +1465,9 @@ class VeditorApp {
     // PIPE_4: Cancel in-flight render tasks for pages outside visible window
     pdfEngine.cancelOutdatedRenderTasks(new Set(visibleIndices));
 
-    // PIPE_3: VRAM Pool OOM Guard - Evict pages beyond dist > 1 from viewport
-    const maxKeepDistance = 1;
+    // PIPE_3: VRAM Pool OOM Guard - Evict pages outside the visible window
+    // At high zoom (> 1.8x), evict immediately (maxKeepDistance = 0) to protect VRAM.
+    const maxKeepDistance = store.zoom > 1.8 ? 0 : 1;
     for (const [pageIndex, p] of this._renderedPages) {
       if (store.activeDocument?.id !== docId || store.isDocSwitching) return;
       let minDistance = Infinity;
@@ -1349,18 +1479,18 @@ class VeditorApp {
       if (minDistance > maxKeepDistance && p.scratchCanvas !== this._handPan?.canvas &&
           !(pointerHandler.isPointerDown && pageIndex === store.activePageIndex)) {
         pdfEngine.cancelPageRender(pageIndex);
-        // Explicitly collapse backing stores to 1x1 to release VRAM buffers immediately
-        p.pdfCanvas.width = 1; p.pdfCanvas.height = 1;
+        // Explicitly collapse backing stores to 0x0 to release VRAM buffers immediately
+        p.pdfCanvas.width = 0; p.pdfCanvas.height = 0;
         if (p.chunkCanvas) {
-          p.chunkCanvas.width = 1; p.chunkCanvas.height = 1;
+          p.chunkCanvas.width = 0; p.chunkCanvas.height = 0;
         }
-        p.annotCanvas.width = 1; p.annotCanvas.height = 1;
+        p.annotCanvas.width = 0; p.annotCanvas.height = 0;
         if (p.annotChunkCanvas) {
-          p.annotChunkCanvas.width = 1; p.annotChunkCanvas.height = 1;
+          p.annotChunkCanvas.width = 0; p.annotChunkCanvas.height = 0;
         }
-        p.scratchCanvas.width = 1; p.scratchCanvas.height = 1;
+        p.scratchCanvas.width = 0; p.scratchCanvas.height = 0;
         if (p.scratchChunkCanvas) {
-          p.scratchChunkCanvas.width = 1; p.scratchChunkCanvas.height = 1;
+          p.scratchChunkCanvas.width = 0; p.scratchChunkCanvas.height = 0;
         }
 
         if (p.container.parentNode === this._pagesWrapper) {
@@ -1492,8 +1622,10 @@ class VeditorApp {
     }
 
     // Update High-DPI Viewport Chunks synchronously right in the layout/render pass
-    // so annotation & scratchpad chunks never lag by a timer after zoom/scroll.
-    this.updateVisiblePageChunks(true);
+    // (unless fast-scrolling across pages, which settles after 110ms).
+    if (!this._isFastScrolling) {
+      this.updateVisiblePageChunks(true, false);
+    }
 
     // 4. Render pass: rasterise and repaint. Visible pages always repaint;
     // pages whose backing stores were just resized repaint exactly once, and
@@ -1503,14 +1635,19 @@ class VeditorApp {
       const isVisible = visibleSet.has(pageIndex);
 
       if (isVisible) {
-        if (p.needsRaster) {
+        // During rapid flick-scrolling, skip starting brand-new PDF.js renders
+        // for intermediate pages that aren't already cached; the 110ms settle
+        // timer will render the destination pages as soon as scroll decelerates.
+        if (p.needsRaster && (!this._isFastScrolling || pdfEngine.hasCachedBitmap(pageIndex))) {
           p.needsRaster = false;
           const rot = store.pageRotations[pageIndex] || 0;
           void pdfEngine.renderPageToCanvas(pageIndex, p.pdfCanvas, store.zoom, rot);
         }
-        p.needsRepaint = false;
-        this.repaintPageAnnotations(pageIndex, p);
-      } else if (p.needsRepaint) {
+        if (!this._isFastScrolling) {
+          p.needsRepaint = false;
+          this.repaintPageAnnotations(pageIndex, p);
+        }
+      } else if (p.needsRepaint && !this._isFastScrolling) {
         p.needsRepaint = false;
         this.repaintPageAnnotations(pageIndex, p);
       }
@@ -1595,7 +1732,7 @@ class VeditorApp {
     const w = Math.max(1, Math.round(layout.width * dpr));
     const h = Math.max(1, Math.round(layout.height * dpr));
 
-    if (!useChunk) {
+    if (!useChunk && !this._isFastScrolling) {
       if (p.annotCanvas.width !== w || p.annotCanvas.height !== h) {
         p.annotCanvas.width = w;
         p.annotCanvas.height = h;
@@ -1606,12 +1743,12 @@ class VeditorApp {
       }
     }
 
-    // Keep idle scratchpad backing stores at 1x1 to save VRAM; allocated on-demand on pointerdown.
+    // Keep idle scratchpad backing stores at 0x0 to save VRAM; allocated on-demand on pointerdown.
     const isStrokeOnPage = pointerHandler.isPointerDown && pageIndex === pointerHandler.activePageIndex;
     if (!isStrokeOnPage && !pointerHandler.isPolygonActiveOnPage(pageIndex)) {
-      if (p.scratchCanvas.width !== 1 || p.scratchCanvas.height !== 1) {
-        p.scratchCanvas.width = 1;
-        p.scratchCanvas.height = 1;
+      if (p.scratchCanvas.width > 1 || p.scratchCanvas.height > 1) {
+        p.scratchCanvas.width = 0;
+        p.scratchCanvas.height = 0;
       }
     }
 
@@ -2296,7 +2433,8 @@ class VeditorApp {
         await this.loadPDF(session.name, session.fileData, targetDocId, session.notebook, {
           activePageIndex: session.activePageIndex || 0,
           savedScrollTop: session.savedScrollTop,
-          savedScrollLeft: session.savedScrollLeft
+          savedScrollLeft: session.savedScrollLeft,
+          annotations: session.annotations
         });
         return;
       }

@@ -244,9 +244,15 @@ export class PDFEngine {
           const cached = session?.pageCache.get(pageNum - 1);
           const p = cached ?? await doc.getPage(pageNum);
           if (session && !session.pageCache.has(pageNum - 1)) {
-            if (session.pageCache.size >= 60) {
+            if (session.pageCache.size >= 24) {
               const oldest = session.pageCache.keys().next().value;
-              if (oldest !== undefined && oldest !== pageNum - 1) session.pageCache.delete(oldest);
+              if (oldest !== undefined && oldest !== pageNum - 1) {
+                const oldPage = session.pageCache.get(oldest);
+                session.pageCache.delete(oldest);
+                if (!this._activeRenderTasks.has(oldest) && !this._activeChunkTasks.has(oldest)) {
+                  try { oldPage?.cleanup(); } catch (_) {}
+                }
+              }
             }
             session.pageCache.set(pageNum - 1, p);
           }
@@ -442,11 +448,15 @@ export class PDFEngine {
   public clearBitmapCache(): void {
     for (const [, entry] of this._renderedBitmaps) {
       if (entry.canvas) {
-        entry.canvas.width = 1;
-        entry.canvas.height = 1;
+        entry.canvas.width = 0;
+        entry.canvas.height = 0;
       }
     }
     this._renderedBitmaps.clear();
+  }
+
+  public hasCachedBitmap(pageIndex: number): boolean {
+    return this.findAnyBitmap(pageIndex) !== undefined;
   }
 
   /** Any cached scale of a page, for instant stale upscale while re-rendering. */
@@ -494,11 +504,13 @@ export class PDFEngine {
       // Stale fetch after a tab switch must not pollute the new doc's cache.
       if (renderDocId !== this._currentDocId) return;
       if (!canvas.isConnected) return;
-      // Evict oldest page when cache gets large without killing active document
-      if (this._pageCache.size >= 60) {
+      // Evict oldest page when cache gets large and release its PDF.js internal resources
+      if (this._pageCache.size >= 24) {
         for (const k of this._pageCache.keys()) {
-          if (k !== pageIndex) {
+          if (k !== pageIndex && !this._activeRenderTasks.has(k) && !this._activeChunkTasks.has(k)) {
+            const evicted = this._pageCache.get(k);
             this._pageCache.delete(k);
+            try { evicted?.cleanup(); } catch (_) {}
             break;
           }
         }
@@ -532,16 +544,24 @@ export class PDFEngine {
 
     // Cap backing-store size and total pixel budget at high zoom/dpr so
     // integrated GPUs and WebKitGTK never allocate multi-hundred-MB canvases.
+    // When a High-DPI Viewport Chunk is active for the visible region, the
+    // full-page background canvas uses a tighter 1536px budget to save VRAM.
     let renderScale = scale * dpr;
     const rawW = Math.floor(rawViewport.width);
     const rawH = Math.floor(rawViewport.height);
     const largest = Math.max(rawW, rawH);
-    if (largest > ADAPTIVE_CANVAS_MAX_DIMENSION && largest > 0) {
-      renderScale *= ADAPTIVE_CANVAS_MAX_DIMENSION / largest;
+    const useChunk = (
+      largest > ADAPTIVE_CANVAS_MAX_DIMENSION * 1.05 ||
+      rawW * rawH > ADAPTIVE_CANVAS_MAX_PIXELS * 1.08
+    );
+    const maxDim = useChunk ? 1536 : ADAPTIVE_CANVAS_MAX_DIMENSION;
+    const maxPixels = useChunk ? 1536 * 1536 : ADAPTIVE_CANVAS_MAX_PIXELS;
+    if (largest > maxDim && largest > 0) {
+      renderScale *= maxDim / largest;
     }
     const cappedArea = (rawW * (renderScale / (scale * dpr))) * (rawH * (renderScale / (scale * dpr)));
-    if (cappedArea > ADAPTIVE_CANVAS_MAX_PIXELS && cappedArea > 0) {
-      renderScale *= Math.sqrt(ADAPTIVE_CANVAS_MAX_PIXELS / cappedArea);
+    if (cappedArea > maxPixels && cappedArea > 0) {
+      renderScale *= Math.sqrt(maxPixels / cappedArea);
     }
     const viewport = renderScale !== scale * dpr
       ? page.getViewport({ scale: renderScale, rotation: totalRotation })
@@ -623,29 +643,29 @@ export class PDFEngine {
       for (const [k, entry] of this._renderedBitmaps) {
         if (entry.pageIndex === pageIndex && k !== exactKey) {
           if (entry.canvas) {
-            entry.canvas.width = 1;
-            entry.canvas.height = 1;
+            entry.canvas.width = 0;
+            entry.canvas.height = 0;
           }
           this._renderedBitmaps.delete(k);
         }
       }
 
-      // PIPE_3 VRAM POOL OOM GUARD: Cap active bitmap cache to 3 pages max.
-      while (this._renderedBitmaps.size >= 3 && !this._renderedBitmaps.has(exactKey)) {
+      // PIPE_3 VRAM POOL OOM GUARD: Cap active bitmap cache to 2 pages max.
+      while (this._renderedBitmaps.size >= 2 && !this._renderedBitmaps.has(exactKey)) {
         const oldestKey = this._renderedBitmaps.keys().next().value;
         if (oldestKey === undefined) break;
         const entry = this._renderedBitmaps.get(oldestKey);
         if (entry?.canvas) {
-          entry.canvas.width = 1;
-          entry.canvas.height = 1;
+          entry.canvas.width = 0;
+          entry.canvas.height = 0;
         }
         this._renderedBitmaps.delete(oldestKey);
       }
 
       const prevExact = this._renderedBitmaps.get(exactKey);
       if (prevExact?.canvas && prevExact.canvas !== offscreen) {
-        prevExact.canvas.width = 1;
-        prevExact.canvas.height = 1;
+        prevExact.canvas.width = 0;
+        prevExact.canvas.height = 0;
       }
 
       this._renderedBitmaps.set(exactKey, {
@@ -672,8 +692,8 @@ export class PDFEngine {
       }
     } finally {
       if (!storedInCache) {
-        offscreen.width = 1;
-        offscreen.height = 1;
+        offscreen.width = 0;
+        offscreen.height = 0;
       }
       if (this._activeRenderTasks.get(pageIndex) === task) {
         this._activeRenderTasks.delete(pageIndex);
@@ -807,10 +827,10 @@ export class PDFEngine {
         console.error(`Error rendering chunk for page ${pageIndex}:`, err);
       }
     } finally {
-      // Immediately collapse the temporary offscreen canvas to 1x1 so its
+      // Immediately collapse the temporary offscreen canvas to 0x0 so its
       // 15–25MB GPU texture is freed deterministically without waiting for GC.
-      offscreen.width = 1;
-      offscreen.height = 1;
+      offscreen.width = 0;
+      offscreen.height = 0;
       if (this._activeChunkTasks.get(pageIndex) === task) {
         this._activeChunkTasks.delete(pageIndex);
       }

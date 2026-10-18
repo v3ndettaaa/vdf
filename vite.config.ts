@@ -1,21 +1,22 @@
 import { defineConfig } from 'vite';
-import { resolve } from 'path';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
 
-const pkg = JSON.parse(fs.readFileSync(resolve(import.meta.dirname, 'package.json'), 'utf-8'));
+const rootDir = import.meta.dirname ?? dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(fs.readFileSync(resolve(rootDir, 'package.json'), 'utf-8'));
 
 export default defineConfig(({ mode }) => {
   const isDesktop = mode === 'desktop';
   const isFirefox = mode === 'firefox';
-  const outDir = isDesktop ? 'dist/desktop' : (isFirefox ? 'dist/firefox' : 'dist/chrome')
-;
+  const outDir = isDesktop ? 'dist/desktop' : (isFirefox ? 'dist/firefox' : 'dist/chrome');
 
   const input: Record<string, string> = isDesktop
-    ? { main: resolve(import.meta.dirname, 'index.html') }
+    ? { main: resolve(rootDir, 'index.html') }
     : {
-        main: resolve(import.meta.dirname, 'index.html'),
-        popup: resolve(import.meta.dirname, 'popup.html'),
-        'service-worker': resolve(import.meta.dirname, 'src/background/service-worker.ts')
+        main: resolve(rootDir, 'index.html'),
+        popup: resolve(rootDir, 'popup.html'),
+        'service-worker': resolve(rootDir, 'src/background/service-worker.ts')
       };
 
   return {
@@ -48,7 +49,7 @@ export default defineConfig(({ mode }) => {
     },
     resolve: {
       alias: {
-        '@': resolve(import.meta.dirname, 'src')
+        '@': resolve(rootDir, 'src')
       }
     },
     plugins: [
@@ -56,8 +57,8 @@ export default defineConfig(({ mode }) => {
         name: 'copy-extension-manifest-and-assets',
         buildStart() {
           // Keep public/pdf.worker.min.mjs synchronized with installed pdfjs-dist version
-          const distWorker = resolve(import.meta.dirname, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs');
-          const publicWorker = resolve(import.meta.dirname, 'public/pdf.worker.min.mjs');
+          const distWorker = resolve(rootDir, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs');
+          const publicWorker = resolve(rootDir, 'public/pdf.worker.min.mjs');
           if (fs.existsSync(distWorker)) {
             fs.copyFileSync(distWorker, publicWorker);
           }
@@ -67,7 +68,7 @@ export default defineConfig(({ mode }) => {
             const url = req.url?.split('?')[0] || '';
             if (url.startsWith('/cmaps/') || url.startsWith('/standard_fonts/')) {
               const rel = url.slice(1);
-              const filePath = resolve(import.meta.dirname, 'node_modules/pdfjs-dist', rel);
+              const filePath = resolve(rootDir, 'node_modules/pdfjs-dist', rel);
               if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
                 res.end(fs.readFileSync(filePath));
                 return;
@@ -87,8 +88,8 @@ export default defineConfig(({ mode }) => {
           }
 
           // Ensure icons directory is copied
-          const iconsSrc = resolve(import.meta.dirname, 'public/icons');
-          const iconsDest = resolve(import.meta.dirname, `${outDir}/icons`);
+          const iconsSrc = resolve(rootDir, 'public/icons');
+          const iconsDest = resolve(rootDir, `${outDir}/icons`);
           if (fs.existsSync(iconsSrc)) {
             fs.mkdirSync(iconsDest, { recursive: true });
             fs.readdirSync(iconsSrc).forEach(file => {
@@ -98,8 +99,8 @@ export default defineConfig(({ mode }) => {
           }
 
           // Copy PDF.js worker
-          const workerSrc = resolve(import.meta.dirname, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs');
-          const fallbackWorkerSrc = resolve(import.meta.dirname, 'public/pdf.worker.min.mjs');
+          const workerSrc = resolve(rootDir, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs');
+          const fallbackWorkerSrc = resolve(rootDir, 'public/pdf.worker.min.mjs');
           const actualWorkerSrc = fs.existsSync(workerSrc) ? workerSrc : fallbackWorkerSrc;
           if (fs.existsSync(actualWorkerSrc)) {
             fs.copyFileSync(actualWorkerSrc, `${outDir}/pdf.worker.min.mjs`);
@@ -120,12 +121,12 @@ export default defineConfig(({ mode }) => {
             }
           };
           copyDirRecursive(
-            resolve(import.meta.dirname, 'node_modules/pdfjs-dist/cmaps'),
-            resolve(import.meta.dirname, `${outDir}/cmaps`)
+            resolve(rootDir, 'node_modules/pdfjs-dist/cmaps'),
+            resolve(rootDir, `${outDir}/cmaps`)
           );
           copyDirRecursive(
-            resolve(import.meta.dirname, 'node_modules/pdfjs-dist/standard_fonts'),
-            resolve(import.meta.dirname, `${outDir}/standard_fonts`)
+            resolve(rootDir, 'node_modules/pdfjs-dist/standard_fonts'),
+            resolve(rootDir, `${outDir}/standard_fonts`)
           );
         }
       }

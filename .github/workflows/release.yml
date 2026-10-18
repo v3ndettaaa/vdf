@@ -37,8 +37,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'
+          node-version: 22
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -49,10 +48,10 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
 
       - name: Install frontend dependencies
-        run: npm ci || npm install
+        run: npm install
 
       - name: Build Tauri Desktop Application
         uses: tauri-apps/tauri-action@v0
@@ -79,19 +78,19 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'
+          node-version: 22
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: npm install
 
       - name: Package browser extensions
         run: npm run package
 
       - name: Read version from package.json
         id: pkg_version
+        shell: bash
         run: |
-          VERSION=$(node -p "require('./package.json').version")
+          VERSION=$(node -e "import fs from 'fs'; console.log(JSON.parse(fs.readFileSync('./package.json', 'utf8')).version);")
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Upload extension zips to GitHub Release

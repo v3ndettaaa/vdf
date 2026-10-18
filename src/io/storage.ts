@@ -111,11 +111,48 @@ export async function openDocumentSession(name: string, fileData: Uint8Array, fo
  * Finds an existing session by its native on-disk path (desktop only), so
  * opening the same file twice resumes it instead of creating a duplicate.
  */
+const DOC_POS_PREFIX = 'veditor:doc-pos:';
+
+function readStoredPosition(docId: string): { activePageIndex?: number; savedScrollTop?: number; savedScrollLeft?: number } | null {
+  try {
+    const storage = getStorageSafe();
+    if (!storage) return null;
+    const raw = storage.getItem(DOC_POS_PREFIX + docId);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeStoredPosition(doc: DocumentSession): void {
+  try {
+    const storage = getStorageSafe();
+    if (!storage) return;
+    storage.setItem(DOC_POS_PREFIX + doc.id, JSON.stringify({
+      activePageIndex: doc.activePageIndex || 0,
+      savedScrollTop: doc.savedScrollTop ?? 0,
+      savedScrollLeft: doc.savedScrollLeft ?? 0
+    }));
+  } catch (_) {}
+}
+
+function applyStoredPosition(session: DocumentSession | undefined): DocumentSession | undefined {
+  if (!session) return undefined;
+  const pos = readStoredPosition(session.id);
+  if (pos) {
+    if (typeof pos.activePageIndex === 'number') session.activePageIndex = pos.activePageIndex;
+    if (typeof pos.savedScrollTop === 'number') session.savedScrollTop = pos.savedScrollTop;
+    if (typeof pos.savedScrollLeft === 'number') session.savedScrollLeft = pos.savedScrollLeft;
+  }
+  return session;
+}
+
 export async function getDocumentSessionByPath(path: string): Promise<DocumentSession | undefined> {
   try {
     const db = await getDB();
     const all = await db.getAll('documents');
-    return all.find(d => d.nativeFilePath === path);
+    return applyStoredPosition(all.find(d => d.nativeFilePath === path));
   } catch (err) {
     console.warn('Could not look up document by path:', err);
     return undefined;
@@ -125,7 +162,7 @@ export async function getDocumentSessionByPath(path: string): Promise<DocumentSe
 export async function getDocumentSession(id: string): Promise<DocumentSession | undefined> {
   try {
     const db = await getDB();
-    return await db.get('documents', id);
+    return applyStoredPosition(await db.get('documents', id));
   } catch (err) {
     console.warn('Could not get document from IndexedDB:', err);
     return undefined;
@@ -177,6 +214,10 @@ export async function getRecentDocuments(): Promise<RecentDocItem[]> {
 
 export async function deleteRecentDocument(docId: string): Promise<void> {
   try {
+    const storage = getStorageSafe();
+    if (storage) {
+      try { storage.removeItem(DOC_POS_PREFIX + docId); } catch (_) {}
+    }
     const db = await getDB();
     await db.delete('recent', docId);
     await db.delete('documents', docId);
@@ -323,8 +364,8 @@ export function persistDocPosition(doc: DocumentSession): void {
   if (existing) clearTimeout(existing);
   positionSaveTimers.set(doc.id, setTimeout(() => {
     positionSaveTimers.delete(doc.id);
-    void saveDocumentSession(doc, { includeBytes: false }).catch(() => {});
-  }, 800));
+    writeStoredPosition(doc);
+  }, 400));
 }
 
 /** Immediately flushes any pending position save for `doc` (tab close / app exit). */
@@ -334,7 +375,7 @@ export async function flushDocPosition(doc: DocumentSession): Promise<void> {
     clearTimeout(existing);
     positionSaveTimers.delete(doc.id);
   }
-  await saveDocumentSession(doc, { includeBytes: false }).catch(() => {});
+  writeStoredPosition(doc);
 }
 
 export async function clearAllStorage(): Promise<void> {

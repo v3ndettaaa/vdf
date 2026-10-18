@@ -22,8 +22,8 @@ export const MAX_RENDER_DIMENSION = 6144;
  * area budget (~9.4 megapixels = 3072x3072) so integrated GPUs and Linux
  * WebKitGTK never stall or OOM when allocating page backing stores.
  */
-export const ADAPTIVE_CANVAS_MAX_DIMENSION = 2560;
-export const ADAPTIVE_CANVAS_MAX_PIXELS = 2560 * 2560;
+export const ADAPTIVE_CANVAS_MAX_DIMENSION = 2048;
+export const ADAPTIVE_CANVAS_MAX_PIXELS = 2048 * 2048;
 
 export function getDevicePixelRatio(): number {
   if (typeof window !== 'undefined' && window.devicePixelRatio) {

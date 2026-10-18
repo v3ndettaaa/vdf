@@ -242,7 +242,9 @@ export class ViewportManager {
     const rawTop = this._scrollContainer.scrollTop;
     const scrollTop = rawTop / this._previewScale;
     const viewH = this._scrollContainer.clientHeight / this._previewScale;
-    const buffer = Math.min(viewH * 0.75, 650); // Tight preload buffer ahead and behind to protect VRAM
+    const buffer = store.zoom > 1.8
+      ? Math.min(viewH * 0.25, 220)
+      : Math.min(viewH * 0.55, 480); // Tight preload buffer ahead and behind to protect VRAM
 
     const newVisible = new Set<number>();
     let centerPage = 0;
